@@ -1,0 +1,22 @@
+- modules:
+  # Enforce some common qualified imports aliases across the codebase
+  - {name: [Data.Aeson, Data.Aeson.Types], as: Aeson}
+  - {name: [Data.ByteArray], as: BA}
+  - {name: [Data.ByteString.Base16], as: B16}
+  - {name: [Data.ByteString.Char8], as: B8}
+  - {name: [Data.ByteString.Lazy], as: BL}
+  - {name: [Data.ByteString], as: BS}
+  - {name: [Data.Foldable], as: F}
+  - {name: [Data.List.NonEmpty], as: NE}
+  - {name: [Data.List], as: L}
+  - {name: [Data.Map.Strict], as: Map}
+  - {name: [Data.Sequence], as: Seq}
+  - {name: [Data.Set, Data.HashSet], as: Set}
+  - {name: [Data.Text, Data.Text.Encoding], as: T}
+  - {name: [Data.Vector], as: V}
+
+
+# Ignore some build-in rules
+- ignore: {name: "Reduce duplication"}
+- ignore: {name: "Redundant bracket"}
+- ignore: {name: "Redundant do"}

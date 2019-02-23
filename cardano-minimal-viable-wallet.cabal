@@ -1,0 +1,59 @@
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.31.0.
+--
+-- see: https://github.com/sol/hpack
+--
+-- hash: ff1022badd3894e2c8c5f901ce0212ce87e0d25bc81a882241d81113c28c05da
+
+name:           cardano-minimal-viable-wallet
+version:        0.1.0.0
+description:    Please see the README on GitHub at <https://github.com/githubuser/cardano-minimal-viable-wallet#readme>
+homepage:       https://github.com/githubuser/cardano-minimal-viable-wallet#readme
+bug-reports:    https://github.com/githubuser/cardano-minimal-viable-wallet/issues
+author:         Author name here
+maintainer:     example@example.com
+copyright:      2019 Author name here
+license:        BSD3
+license-file:   LICENSE
+build-type:     Simple
+extra-source-files:
+    README.md
+    ChangeLog.md
+
+source-repository head
+  type: git
+  location: https://github.com/githubuser/cardano-minimal-viable-wallet
+
+executable cardano-minimal-viable-wallet-exe
+  main-is: Main.hs
+  other-modules:
+      Paths_cardano_minimal_viable_wallet
+  hs-source-dirs:
+      app
+  ghc-options: -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base >=4.7 && <5
+
+    -- Hackage Dependencies
+    , aeson
+    , aeson-pretty
+    , base16-bytestring
+    , base58-bytestring
+    , bytestring
+    , cborg
+    , containers
+    , cryptonite
+    , deepseq
+    , digest
+    , generic-lens
+    , http-client
+    , memory
+    , microlens
+    , text
+    , time
+    , transformers
+
+    -- Other Project Dependencies
+    , cardano-crypto
+  default-language: Haskell2010

@@ -1,0 +1,16 @@
+columns: 80
+steps:
+  - imports:
+      align: none
+      list_align: new_line
+      pad_module_names: false
+      long_list_align: new_line_multiline
+      empty_list_align: inherit
+      list_padding: 4
+      separate_lists: true
+      space_surround: true
+
+  - language_pragmas:
+      style: vertical
+      align: false
+      remove_redundant: true
