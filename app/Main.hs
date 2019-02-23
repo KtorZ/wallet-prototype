@@ -1,19 +1,30 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes        #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RankNTypes          #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main where
 
-import           Control.Monad        (void)
+import           Control.Monad            (void)
 
-import qualified Codec.CBOR.Decoding  as CBOR
-import qualified Codec.CBOR.Read      as CBOR
-import           Data.ByteString.Lazy (ByteString)
-import           Data.Word            (Word16, Word64)
-import           Network.HTTP.Client  (defaultRequest, httpLbs, path, port,
-                                       responseBody)
-import qualified Network.HTTP.Client  as HTTP
-
-import           Debug.Trace          (traceShow)
+import qualified Codec.CBOR.Decoding      as CBOR
+import qualified Codec.CBOR.Encoding      as CBOR
+import qualified Codec.CBOR.Read          as CBOR
+import qualified Codec.CBOR.Write         as CBOR
+import           Data.Aeson               (ToJSON (..))
+import qualified Data.Aeson               as Aeson
+import qualified Data.Aeson.Encode.Pretty as Aeson
+import           Data.ByteString          (ByteString)
+import qualified Data.ByteString.Base16   as B16
+import           Data.ByteString.Base58   (bitcoinAlphabet, encodeBase58)
+import qualified Data.ByteString.Lazy     as BL
+import qualified Data.Text.Encoding       as T
+import           Data.Word                (Word16, Word32, Word64)
+import           Debug.Trace              (traceShow)
+import           GHC.Generics             (Generic)
+import           Network.HTTP.Client      (defaultRequest, httpLbs, path, port,
+                                           responseBody, responseStatus)
+import qualified Network.HTTP.Client      as HTTP
 
 main :: IO ()
 main = do
@@ -23,12 +34,10 @@ main = do
         , path = "/mainnet/block/dd458ad4e1a2dff75c1d3f37704ba505405b12bdd28ed13a547c7467c87ff6a5"
         }
   response <- httpLbs req manager
-  print response
-  -- let bytes :: ByteString
-  --     bytes = "\130\SOH\133\SUB-\150J\tX $\132\SUB\SOH\v$\177\EOTZ\148\255`W\155\138\229T\EOT\214\136\141\183X'\133s\176\250\143\233\DC4\224\132\131\SOHX \194B\DC4\n\228\NUL\191\157y\171=p\136A0\165\190\210\ACK\169\210\159r\DC1\234\218\ESC\SO\195\&4\ACKDX \165\134\GS\t\166R\238\213\&9\240;\154\221\\\201f\DLEP^y\155\234\146\200_\227\238\249\DC3\235\RS8\131\STXX \211j&\EM\166rIF\EOT\225\ESC\180G\203\207R1\233\242\186%\194\SYN\145w\237\201A\189P\173lX \211j&\EM\166rIF\EOT\225\ESC\180G\203\207R1\233\242\186%\194\SYN\145w\237\201A\189P\173lX \175\192\218d\CAN;\242fO=N\236r8\213$\186`\DEL\174\234\178O\193\NUL\235\134\GS\186i\151\ESCX Nf(\f\217MY\DLEr4\155\236\n0\144\165:\169EV.\251m\b\213nSeK\SO@\152\132\130\CAN`\EMT_X@\153:\143\ENQm->P\176\172`\DC3\159\DLE\223\143\129#\213\247\196\129{@\218\194\181\221\138\169J\130\232Sh2\230\&1-\223\192x}{S\DLE\200\NAKeZ\218O\219\207k\DC2)}DX\236\204-\251\129\SUB\NUL\US\242\147\130\STX\130\132\NULX@\153:\143\ENQm->P\176\172`\DC3\159\DLE\223\143\129#\213\247\196\129{@\218\194\181\221\138\169J\130\232Sh2\230\&1-\223\192x}{S\DLE\200\NAKeZ\218O\219\207k\DC2)}DX\236\204-\251X@\137\194\159\140J\242{z\204\190X\151G\130\SOH4\235\186\161\202\243\206\148\146p\163\208\199\220\253T\ESC\GS\239\&2m.\240\219x\ETXA\201\226a\240H\144\205\238\241\249\201\159m\144\184\237\202}<\252\t\136X@Ik)\181\197~\138\199\207\252n\139^@\179\210`\228\a\173M\ty-\236\176\162-T\218\DEL\136(&V\136\161\138\161\165\199m\158tw\165\244\166PP\DC4\t\253\205\&8U\179\NUL\253.+\195\198\ENQX@G5\237%*\STX\171\224\132\EM\SO\175Q\SOHGI\SYN\ETX\ENQ}?\225w\RS\147\CAN\189\217\ENQ\224l\RShzD\133c\130\151K)\159r}1}L\196u%\252\t\EM\235\232\157\142\198\207\179\&0\251\233\ACK\132\131\NUL\STX\NUL\130jcardano-sl\SOH\160X K\169*\163 \198\n\204\154\215\185\166O.\218U\196\210\236(\230\EOT\250\241\134p\139O\fN\142\223"
-
-  let bytes = responseBody response
-  print $ CBOR.deserialiseFromBytes decodeBlock bytes
+  print $ responseStatus response
+  let (Right (_, block)) = CBOR.deserialiseFromBytes decodeBlock $ responseBody response
+  print block
+  BL.putStrLn $ Aeson.encodePretty block
 
 
 {-------------------------------------------------------------------------------
@@ -38,14 +47,64 @@ main = do
 data BlockHeader = BlockHeader
     { epochIndex :: Word64
     , slotNumber :: Word16
-    } deriving (Show)
+    } deriving (Show, Generic)
+
+instance ToJSON BlockHeader where
+    toJSON = Aeson.genericToJSON Aeson.defaultOptions
+
 
 data Block = Block
     { header       :: BlockHeader
     , transactions :: [Tx]
-    } deriving (Show)
+    } deriving (Show, Generic)
 
-data Tx = Tx deriving (Show)
+instance ToJSON Block where
+    toJSON = Aeson.genericToJSON Aeson.defaultOptions
+
+
+data Tx = Tx
+    { inputs  :: [TxInput]
+    , outputs :: [TxOutput]
+    } deriving (Show, Generic)
+
+instance ToJSON Tx where
+    toJSON = Aeson.genericToJSON Aeson.defaultOptions
+
+
+newtype Address = Address
+    { getAddress :: ByteString
+    } deriving (Show, Generic)
+
+instance ToJSON Address where
+    toJSON = Aeson.String . T.decodeUtf8 . encodeBase58 bitcoinAlphabet . getAddress
+
+
+newtype TxId = TxId
+    { getTxId :: ByteString
+    } deriving (Show, Generic)
+
+instance ToJSON TxId where
+    toJSON = Aeson.String . T.decodeUtf8 . B16.encode . getTxId
+
+data TxInput = TxInput
+    { txId    :: TxId
+    , txIndex :: Word32
+    } deriving (Show, Generic)
+
+instance ToJSON TxInput where
+    toJSON = Aeson.genericToJSON Aeson.defaultOptions
+
+
+data TxOutput = TxOutput
+    { address :: Address
+    , coin    :: Word64
+    } deriving (Show, Generic)
+
+instance ToJSON TxOutput where
+    toJSON = Aeson.genericToJSON Aeson.defaultOptions
+
+
+data TxWitness = TxWitness deriving (Show)
 
 
 {-------------------------------------------------------------------------------
@@ -66,21 +125,29 @@ data Tx = Tx deriving (Show)
    in handy to debug and see what CBOR is actually expecting behind the scene.
 --------------------------------------------------------------------------------}
 
+decodeAddress :: CBOR.Decoder s Address
+decodeAddress = do
+    _ <- CBOR.decodeListLenCanonicalOf 2 -- CRC Protection Wrapper
+    tag <- CBOR.decodeTag -- Myterious hard-coded tag cardano-sl seems to so much like
+    bytes <- CBOR.decodeBytes -- Addr Root + Attributes + Type
+    crc <- CBOR.decodeWord -- CRC
+    -- NOTE 1:
+    -- Treating addresses as a blob here, so we just reencod them as such
+    -- Ultimately for us, addresses are nothing more than a bunch of bytes that
+    -- we display in a Base58 format when we have too.
+    --
+    -- NOTE 2:
+    -- We may want to check the CRC at this level as-well... maybe not.
+    return $ Address $ CBOR.toStrictByteString $ mempty
+        <> CBOR.encodeListLen 2
+        <> CBOR.encodeTag tag
+        <> CBOR.encodeBytes bytes
+        <> CBOR.encodeWord crc
 
--- | Inspect the next token that has to be decoded and print it to the console
--- as a trace. Useful for debugging Decoders.
--- Example:
---
---     myDecoder :: CBOR.Decoder s MyType
---     myDecoder = do
---         a <- CBOR.decodeWord64
---         inspectNextToken
---         [...]
---
-inspectNextToken :: CBOR.Decoder s ()
-inspectNextToken =
-  CBOR.peekTokenType >>= flip traceShow (return ())
-
+decodeAttributes :: CBOR.Decoder s ()
+decodeAttributes = do
+    _ <- CBOR.decodeMapLenCanonical -- Empty map of attributes
+    return ()
 
 decodeBlock :: CBOR.Decoder s Block
 decodeBlock = do
@@ -92,36 +159,35 @@ decodeBlock = do
 
         1 -> do -- Main Block
             CBOR.decodeListLenCanonicalOf 3
-            header <- decodeBlockHeader
-            transactions <- decodeBlockBody
-            _ <- decodeMainExtraData
+            header <- decodeMainBlockHeader
+            transactions <- decodeMainBlockBody
+            -- _ <- decodeMainExtraData
             return $ Block header transactions
 
         _ -> do
             fail $ "decodeBlock: unknown block constructor: " <> show t
-
 
 decodeBlockHeader :: CBOR.Decoder s BlockHeader
 decodeBlockHeader = do
     CBOR.decodeListLenCanonicalOf 2
     t <- CBOR.decodeWordCanonical
     case t of
-      0 -> do -- Genesis Block Header
-        _ <- CBOR.decodeListLenCanonicalOf 3
-        _ <- decodeGenesisProof
-        epochIndex <- decodeGenesisConsensusData
-        _ <- decodeGenesisExtraData
-        return $ BlockHeader epochIndex 0
-      1 -> do -- Main Block Header
-        _ <- CBOR.decodeListLenCanonicalOf 5
-        _ <- decodeProtocolMagic
-        _ <- decodePreviousBlockHeader
-        _ <- decodeMainProof
-        (epochIndex, slotNumber) <- decodeMainConsensusData
-        _ <- decodeMainExtraData
-        return $ BlockHeader epochIndex slotNumber
-      _ ->
-        fail $ "decodeBlockHeader: unknown block header constructor: " <> show t
+      0 -> decodeGenesisBlockHeader
+      1 -> decodeMainBlockHeader
+      _ -> fail $ "decodeBlockHeader: unknown block header constructor: " <> show t
+
+decodeBlockVersion :: CBOR.Decoder s ()
+decodeBlockVersion = do
+    _ <- CBOR.decodeListLenCanonicalOf 3
+    _ <- CBOR.decodeWord16 -- Major
+    _ <- CBOR.decodeWord16 -- Minor
+    _ <- CBOR.decodeWord8  -- Patch
+    return ()
+
+decodeDataProof :: CBOR.Decoder s ()
+decodeDataProof = do
+    _ <- CBOR.decodeBytes -- Proof Hash
+    return ()
 
 decodeCertificatesProof :: CBOR.Decoder s ()
 decodeCertificatesProof = do
@@ -134,9 +200,90 @@ decodeCommitmentsProof = do
     _ <- CBOR.decodeBytes -- Vss Certificates Hash
     return ()
 
+decodeDifficulty :: CBOR.Decoder s ()
+decodeDifficulty = do
+    _ <- CBOR.decodeListLenCanonicalOf 1
+    _ <- CBOR.decodeWord64
+    return ()
+
+decodeGenesisBlockHeader :: CBOR.Decoder s BlockHeader
+decodeGenesisBlockHeader = do
+    _ <- CBOR.decodeListLenCanonicalOf 3
+    _ <- decodeGenesisProof
+    epochIndex <- decodeGenesisConsensusData
+    _ <- decodeGenesisExtraData
+    return $ BlockHeader epochIndex 0
+
+decodeGenesisConsensusData :: CBOR.Decoder s Word64
+decodeGenesisConsensusData = do
+    _ <- CBOR.decodeListLenCanonicalOf 2
+    epochIndex <- CBOR.decodeWord64
+    _ <- decodeDifficulty
+    return epochIndex
+
+decodeGenesisExtraData :: CBOR.Decoder s ()
+decodeGenesisExtraData = do
+    _ <- decodeAttributes
+    return ()
+
 decodeGenesisProof :: CBOR.Decoder s ()
 decodeGenesisProof = do
     _ <- CBOR.decodeBytes -- Slot Leaders Hash
+    return ()
+
+decodeHeavyIndex :: CBOR.Decoder s ()
+decodeHeavyIndex = do
+    _ <- CBOR.decodeWord64 -- Epoch Index
+    return ()
+
+decodeLeaderKey :: CBOR.Decoder s ()
+decodeLeaderKey = do
+    _ <- CBOR.decodeBytes
+    return ()
+
+decodeLightIndex :: CBOR.Decoder s ()
+decodeLightIndex = do
+    _ <- CBOR.decodeListLenCanonicalOf 2
+    _ <- CBOR.decodeWord64 -- Epoch Index #1
+    _ <- CBOR.decodeWord64 -- Epoch Index #2
+    return ()
+
+decodeMainBlockBody :: CBOR.Decoder s [Tx]
+decodeMainBlockBody = do
+    _ <- CBOR.decodeListLenCanonicalOf 4
+    decodeTxPayload
+    -- NOTE:
+    -- Would remain after that:
+    --  - SscPayload
+    --  - DlsPayload
+    --  - UpdatePayload
+
+decodeMainBlockHeader :: CBOR.Decoder s BlockHeader
+decodeMainBlockHeader = do
+    _ <- CBOR.decodeListLenCanonicalOf 5
+    _ <- decodeProtocolMagic
+    _ <- decodePreviousBlockHeader
+    _ <- decodeMainProof
+    (epochIndex, slotNumber) <- decodeMainConsensusData
+    _ <- decodeMainExtraData
+    return $ BlockHeader epochIndex slotNumber
+
+decodeMainConsensusData :: CBOR.Decoder s (Word64, Word16)
+decodeMainConsensusData = do
+    _ <- CBOR.decodeListLenCanonicalOf 4
+    slot <- decodeSlotId
+    _ <- decodeLeaderKey
+    _ <- decodeDifficulty
+    _ <- decodeSignature
+    return slot
+
+decodeMainExtraData :: CBOR.Decoder s ()
+decodeMainExtraData = do
+    _ <- CBOR.decodeListLenCanonicalOf 4
+    _ <- decodeBlockVersion
+    _ <- decodeSoftwareVersion
+    _ <- decodeAttributes
+    _ <- decodeDataProof
     return ()
 
 decodeMainProof :: CBOR.Decoder s ()
@@ -164,73 +311,15 @@ decodeOpeningsProof = do
     _ <- CBOR.decodeBytes -- Vss Certificates Hash
     return ()
 
-decodeProxySKsProof :: CBOR.Decoder s ()
-decodeProxySKsProof = do
-    _ <- CBOR.decodeBytes -- Dlg Payload Hash
-    return ()
-
-decodeSharesProof :: CBOR.Decoder s ()
-decodeSharesProof = do
-    _ <- CBOR.decodeBytes -- Shares Hash
-    _ <- CBOR.decodeBytes -- Vss Certificates Hash
-    return ()
-
-decodeTxProof :: CBOR.Decoder s ()
-decodeTxProof = do
-    CBOR.decodeListLenCanonicalOf 3
-    _ <- CBOR.decodeWord32 -- Number
-    _ <- CBOR.decodeBytes  -- Merkle Root Hash
-    _ <- CBOR.decodeBytes  -- Witnesses Hash
-    return ()
-
-decodeUpdateProof :: CBOR.Decoder s ()
-decodeUpdateProof = do
-    _ <- CBOR.decodeBytes -- Update Hash
-    return ()
-
-decodeGenesisConsensusData :: CBOR.Decoder s Word64
-decodeGenesisConsensusData = do
-    _ <- CBOR.decodeListLenCanonicalOf 2
-    epochIndex <- CBOR.decodeWord64
-    _ <- decodeDifficulty
-    return epochIndex
-
-decodeMainConsensusData :: CBOR.Decoder s (Word64, Word16)
-decodeMainConsensusData = do
-    _ <- CBOR.decodeListLenCanonicalOf 4
-    slot <- decodeSlotId
-    _ <- decodeLeaderKey
-    _ <- decodeDifficulty
-    _ <- decodeSignature
-    return slot
-
-decodeSlotId :: CBOR.Decoder s (Word64, Word16)
-decodeSlotId = do
-    _ <- CBOR.decodeListLenCanonicalOf 2
-    epochIndex <- CBOR.decodeWord64
-    slotNumber <- CBOR.decodeWord16
-    return (epochIndex, slotNumber)
-
-decodeLeaderKey :: CBOR.Decoder s ()
-decodeLeaderKey = do
+decodePreviousBlockHeader :: CBOR.Decoder s ()
+decodePreviousBlockHeader = do
     _ <- CBOR.decodeBytes
     return ()
 
-decodeDifficulty :: CBOR.Decoder s ()
-decodeDifficulty = do
-    _ <- CBOR.decodeListLenCanonicalOf 1
-    _ <- CBOR.decodeWord64
+decodeProtocolMagic :: CBOR.Decoder s ()
+decodeProtocolMagic = do
+    _ <- CBOR.decodeInt32
     return ()
-
-decodeSignature :: CBOR.Decoder s ()
-decodeSignature = do
-    _ <- CBOR.decodeListLenCanonicalOf 2
-    t <- CBOR.decodeWord8
-    case t of
-        0 -> void CBOR.decodeBytes
-        1 -> decodeProxySignature decodeLightIndex
-        2 -> decodeProxySignature decodeHeavyIndex
-        _ -> fail $ "decodeSignature: unknown signature constructor: " <> show t
 
 decodeProxySignature
     :: (forall s. CBOR.Decoder s ())
@@ -250,39 +339,33 @@ decodeProxySignature decodeIndex = do
         _ <- CBOR.decodeBytes -- Proxy Certificate Key
         return ()
 
-decodeLightIndex :: CBOR.Decoder s ()
-decodeLightIndex = do
+decodeProxySKsProof :: CBOR.Decoder s ()
+decodeProxySKsProof = do
+    _ <- CBOR.decodeBytes -- Dlg Payload Hash
+    return ()
+
+decodeSignature :: CBOR.Decoder s ()
+decodeSignature = do
     _ <- CBOR.decodeListLenCanonicalOf 2
-    _ <- CBOR.decodeWord64 -- Epoch Index #1
-    _ <- CBOR.decodeWord64 -- Epoch Index #2
+    t <- CBOR.decodeWord8
+    case t of
+        0 -> void CBOR.decodeBytes
+        1 -> decodeProxySignature decodeLightIndex
+        2 -> decodeProxySignature decodeHeavyIndex
+        _ -> fail $ "decodeSignature: unknown signature constructor: " <> show t
+
+decodeSharesProof :: CBOR.Decoder s ()
+decodeSharesProof = do
+    _ <- CBOR.decodeBytes -- Shares Hash
+    _ <- CBOR.decodeBytes -- Vss Certificates Hash
     return ()
 
-decodeHeavyIndex :: CBOR.Decoder s ()
-decodeHeavyIndex = do
-    _ <- CBOR.decodeWord64 -- Epoch Index
-    return ()
-
-decodeMainExtraData :: CBOR.Decoder s ()
-decodeMainExtraData = do
-    _ <- CBOR.decodeListLenCanonicalOf 4
-    _ <- decodeBlockVersion
-    _ <- decodeSoftwareVersion
-    _ <- decodeAttributes
-    _ <- decodeDataProof
-    return ()
-
-decodeGenesisExtraData :: CBOR.Decoder s ()
-decodeGenesisExtraData = do
-    _ <- decodeAttributes
-    return ()
-
-decodeBlockVersion :: CBOR.Decoder s ()
-decodeBlockVersion = do
-    _ <- CBOR.decodeListLenCanonicalOf 3
-    _ <- CBOR.decodeWord16 -- Major
-    _ <- CBOR.decodeWord16 -- Minor
-    _ <- CBOR.decodeWord8  -- Patch
-    return ()
+decodeSlotId :: CBOR.Decoder s (Word64, Word16)
+decodeSlotId = do
+    _ <- CBOR.decodeListLenCanonicalOf 2
+    epochIndex <- CBOR.decodeWord64
+    slotNumber <- CBOR.decodeWord16
+    return (epochIndex, slotNumber)
 
 decodeSoftwareVersion :: CBOR.Decoder s ()
 decodeSoftwareVersion = do
@@ -291,22 +374,121 @@ decodeSoftwareVersion = do
     _ <- CBOR.decodeWord32 -- Software Version
     return ()
 
-decodeAttributes :: CBOR.Decoder s ()
-decodeAttributes = do
-    _ <- CBOR.decodeMapLenCanonical -- Empty map of attributes
+decodeTx :: CBOR.Decoder s (Tx, TxWitness)
+decodeTx = do
+    _ <- CBOR.decodeListLenCanonicalOf 2
+    _ <- CBOR.decodeListLenCanonicalOf 3
+    inputs <- decodeListIndef decodeTxInput
+    outputs <- decodeListIndef decodeTxOutput
+    _ <- decodeAttributes
+    _ <- decodeList decodeTxWitness
+    return (Tx inputs outputs, TxWitness)
+
+decodeTxPayload :: CBOR.Decoder s [Tx]
+decodeTxPayload = do
+    (txs, _) <- unzip <$> decodeListIndef decodeTx
+    return txs
+
+decodeTxInput :: CBOR.Decoder s TxInput
+decodeTxInput = do
+    _ <- CBOR.decodeListLenCanonicalOf 2
+    t <- CBOR.decodeWord8
+    case t of
+        0 -> do
+            _ <- CBOR.decodeTag
+            bytes <- CBOR.decodeBytes
+            case CBOR.deserialiseFromBytes decodeTxInput' (BL.fromStrict bytes) of
+                Right (_, input) -> return input
+                Left err         -> fail $ show err
+        _ -> fail $ "decodeTxInput: unknown tx input constructor: " <> show t
+  where
+    decodeTxInput' :: CBOR.Decoder s TxInput
+    decodeTxInput' = do
+        _ <- CBOR.decodeListLenCanonicalOf 2
+        txId <- CBOR.decodeBytes
+        index <- CBOR.decodeWord32
+        return $ TxInput (TxId txId) index
+
+decodeTxOutput :: CBOR.Decoder s TxOutput
+decodeTxOutput = do
+    _ <- CBOR.decodeListLenCanonicalOf 2
+    addr <- decodeAddress
+    coin <- CBOR.decodeWord64
+    return $ TxOutput addr coin
+
+decodeTxProof :: CBOR.Decoder s ()
+decodeTxProof = do
+    CBOR.decodeListLenCanonicalOf 3
+    _ <- CBOR.decodeWord32 -- Number
+    _ <- CBOR.decodeBytes  -- Merkle Root Hash
+    _ <- CBOR.decodeBytes  -- Witnesses Hash
     return ()
 
-decodeDataProof :: CBOR.Decoder s ()
-decodeDataProof = do
-    _ <- CBOR.decodeBytes -- Proof Hash
+decodeTxWitness :: CBOR.Decoder s ()
+decodeTxWitness = do
+    _ <- CBOR.decodeListLenCanonicalOf 2
+    t <- CBOR.decodeWord8
+    case t of
+        0 -> CBOR.decodeTag *> CBOR.decodeBytes -- PKWitness
+        1 -> CBOR.decodeTag *> CBOR.decodeBytes -- Script Witness
+        2 -> CBOR.decodeTag *> CBOR.decodeBytes -- Redeem Witness
+        _ -> fail $ "decodeTxWitness: unknown tx witness constructor: " <> show t
     return ()
 
-decodeProtocolMagic :: CBOR.Decoder s ()
-decodeProtocolMagic = do
-    _ <- CBOR.decodeInt32
+decodeUpdateProof :: CBOR.Decoder s ()
+decodeUpdateProof = do
+    _ <- CBOR.decodeBytes -- Update Hash
     return ()
 
-decodePreviousBlockHeader :: CBOR.Decoder s ()
-decodePreviousBlockHeader = do
-    _ <- CBOR.decodeBytes
-    return ()
+
+{-------------------------------------------------------------------------------
+                                CBOR EXTRA
+
+  Some Extra Helper on top of the CBOR library to help writing decoders.
+
+--------------------------------------------------------------------------------}
+
+
+-- | Inspect the next token that has to be decoded and print it to the console
+-- as a trace. Useful for debugging Decoders.
+-- Example:
+--
+--     myDecoder :: CBOR.Decoder s MyType
+--     myDecoder = do
+--         a <- CBOR.decodeWord64
+--         inspectNextToken
+--         [...]
+--
+inspectNextToken :: CBOR.Decoder s ()
+inspectNextToken =
+  CBOR.peekTokenType >>= flip traceShow (return ())
+
+-- | Decode an list of known length. Very similar to @decodeListIndef@.
+--
+-- Example:
+--
+--     myDecoder :: CBOR.Decoder s [MyType]
+--     myDecoder = decodeList decodeOne
+--       where
+--         decodeOne :: CBOR.Decoder s MyType
+--
+decodeList :: forall s a . CBOR.Decoder s a -> CBOR.Decoder s [a]
+decodeList decodeOne = do
+    l <- CBOR.decodeListLenCanonical
+    CBOR.decodeSequenceLenN (\xs x -> xs ++ [x]) [] id l decodeOne
+
+-- | Decode an arbitrary long list. CBOR introduce a "break" character to
+-- mark the end of the list, so we simply decode each item until we encounter
+-- a break character.
+--
+-- Example:
+--
+--     myDecoder :: CBOR.Decoder s [MyType]
+--     myDecoder = decodeListIndef decodeOne
+--       where
+--         decodeOne :: CBOR.Decoder s MyType
+--
+decodeListIndef :: forall s a. CBOR.Decoder s a -> CBOR.Decoder s [a]
+decodeListIndef decodeOne = do
+    _ <- CBOR.decodeListLenIndef
+    CBOR.decodeSequenceLenIndef (\xs x -> xs ++ [x]) [] id decodeOne
