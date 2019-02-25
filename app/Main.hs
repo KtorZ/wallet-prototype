@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE DeriveGeneric       #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RankNTypes          #-}
@@ -5,67 +6,86 @@
 
 module Main where
 
-import           Control.Monad            (void)
-
-import qualified Codec.CBOR.Decoding      as CBOR
-import qualified Codec.CBOR.Encoding      as CBOR
-import qualified Codec.CBOR.Read          as CBOR
-import qualified Codec.CBOR.Write         as CBOR
-import           Data.Aeson               (ToJSON (..))
-import qualified Data.Aeson               as Aeson
-import qualified Data.Aeson.Encode.Pretty as Aeson
-import           Data.ByteString          (ByteString)
-import qualified Data.ByteString.Base16   as B16
-import           Data.ByteString.Base58   (bitcoinAlphabet, encodeBase58)
-import qualified Data.ByteString.Lazy     as BL
-import qualified Data.Text.Encoding       as T
-import           Data.Word                (Word16, Word32, Word64)
-import           Debug.Trace              (traceShow)
-import           GHC.Generics             (Generic)
-import           Network.HTTP.Client      (defaultRequest, httpLbs, path, port,
-                                           responseBody, responseStatus)
-import qualified Network.HTTP.Client      as HTTP
+import qualified Codec.CBOR.Decoding        as CBOR
+import qualified Codec.CBOR.Encoding        as CBOR
+import qualified Codec.CBOR.Read            as CBOR
+import qualified Codec.CBOR.Write           as CBOR
+import           Control.Arrow              (first)
+import           Control.DeepSeq            (NFData, deepseq)
+import           Control.Monad              (void)
+import           Control.Monad.State.Strict (State, evalState, get, modify,
+                                             state)
+import           Data.Aeson                 (ToJSON (..))
+import qualified Data.Aeson                 as Aeson
+import qualified Data.Aeson.Encode.Pretty   as Aeson
+import           Data.Bits                  (shiftL, (.|.))
+import           Data.ByteString            (ByteString)
+import qualified Data.ByteString.Base16     as B16
+import           Data.ByteString.Base58     (bitcoinAlphabet, encodeBase58)
+import qualified Data.ByteString.Char8      as BS
+import qualified Data.ByteString.Lazy       as BL
+import qualified Data.ByteString.Lazy.Char8 as BL8
+import           Data.Int                   (Int64)
+import qualified Data.Text.Encoding         as T
+import           Data.Time.Clock            (diffUTCTime, getCurrentTime)
+import           Data.Word                  (Word16, Word32, Word64)
+import           Debug.Trace                (traceShow)
+import           GHC.Generics               (Generic)
+import           Network.HTTP.Client        (Manager, defaultRequest, httpLbs,
+                                             path, port, responseBody,
+                                             responseStatus)
+import qualified Network.HTTP.Client        as HTTP
 
 main :: IO ()
-main = do
-  manager <- HTTP.newManager HTTP.defaultManagerSettings
-  let req = defaultRequest
-        { port = 1337
-        , path = "/mainnet/block/dd458ad4e1a2dff75c1d3f37704ba505405b12bdd28ed13a547c7467c87ff6a5"
-        }
-  response <- httpLbs req manager
-  print $ responseStatus response
-  let (Right (_, block)) = CBOR.deserialiseFromBytes decodeBlock $ responseBody response
-  print block
-  BL.putStrLn $ Aeson.encodePretty block
+main = timed $ do
+    net <- newNetworkLayer
+    epochs  <- traverse (getEpoch net) [0..9]
+    print $ length epochs
 
 
 {-------------------------------------------------------------------------------
-                                  TYPES
+                            PRIMITIVE TYPES
 --------------------------------------------------------------------------------}
 
-data BlockHeader = BlockHeader
-    { epochIndex :: Word64
-    , slotNumber :: Word16
+data Block = Block
+    { header       :: !BlockHeader
+    , transactions :: [Tx]
     } deriving (Show, Generic)
+
+instance NFData Block
+
+instance ToJSON Block where
+    toJSON = Aeson.genericToJSON Aeson.defaultOptions
+
+
+data BlockHeader = BlockHeader
+    { epochIndex    :: !Word64
+    , slotNumber    :: !Word16
+    , previousBlock :: !BlockHeaderHash
+    } deriving (Show, Generic)
+
+instance NFData BlockHeader
 
 instance ToJSON BlockHeader where
     toJSON = Aeson.genericToJSON Aeson.defaultOptions
 
 
-data Block = Block
-    { header       :: BlockHeader
-    , transactions :: [Tx]
+newtype BlockHeaderHash = BlockHeaderHash
+    { getBlockHeaderHash :: ByteString
     } deriving (Show, Generic)
 
-instance ToJSON Block where
-    toJSON = Aeson.genericToJSON Aeson.defaultOptions
+instance NFData BlockHeaderHash
+
+instance ToJSON BlockHeaderHash where
+    toJSON = Aeson.String . T.decodeUtf8 . getBlockHeaderHash
 
 
 data Tx = Tx
     { inputs  :: [TxInput]
     , outputs :: [TxOutput]
     } deriving (Show, Generic)
+
+instance NFData Tx
 
 instance ToJSON Tx where
     toJSON = Aeson.genericToJSON Aeson.defaultOptions
@@ -75,6 +95,8 @@ newtype Address = Address
     { getAddress :: ByteString
     } deriving (Show, Generic)
 
+instance NFData Address
+
 instance ToJSON Address where
     toJSON = Aeson.String . T.decodeUtf8 . encodeBase58 bitcoinAlphabet . getAddress
 
@@ -83,28 +105,147 @@ newtype TxId = TxId
     { getTxId :: ByteString
     } deriving (Show, Generic)
 
+instance NFData TxId
+
 instance ToJSON TxId where
     toJSON = Aeson.String . T.decodeUtf8 . B16.encode . getTxId
 
 data TxInput = TxInput
-    { txId    :: TxId
-    , txIndex :: Word32
+    { txId    :: !TxId
+    , txIndex :: !Word32
     } deriving (Show, Generic)
+
+instance NFData TxInput
 
 instance ToJSON TxInput where
     toJSON = Aeson.genericToJSON Aeson.defaultOptions
 
 
 data TxOutput = TxOutput
-    { address :: Address
-    , coin    :: Word64
+    { address :: !Address
+    , coin    :: !Word64
     } deriving (Show, Generic)
+
+instance NFData TxOutput
 
 instance ToJSON TxOutput where
     toJSON = Aeson.genericToJSON Aeson.defaultOptions
 
 
 data TxWitness = TxWitness deriving (Show)
+
+
+{-------------------------------------------------------------------------------
+                              NETWORK LAYER
+--------------------------------------------------------------------------------}
+
+data NetworkLayer = NetworkLayer
+    { getBlock :: BlockHeaderHash -> IO Block
+    , getEpoch :: Int -> IO [Block]
+    }
+
+
+mkNetworkLayer :: Manager -> NetworkLayer
+mkNetworkLayer manager = NetworkLayer
+    { getBlock = _getBlock manager
+    , getEpoch = _getEpoch manager
+    }
+
+
+newNetworkLayer :: IO NetworkLayer
+newNetworkLayer = do
+    manager <- HTTP.newManager HTTP.defaultManagerSettings
+    return $ mkNetworkLayer manager
+
+
+_getBlock :: Manager -> BlockHeaderHash -> IO Block
+_getBlock manager (BlockHeaderHash hash) = do
+    let req = defaultRequest
+            { port = 1337
+            , path = "/mainnet/block/" <> hash
+            }
+    res <- httpLbs req manager
+    let (Right (_, block)) = CBOR.deserialiseFromBytes decodeBlock $ responseBody res
+    return $ block `deepseq` block
+
+
+_getEpoch :: Manager -> Int -> IO [Block]
+_getEpoch manager n = do
+    let req = defaultRequest
+            { port = 1337
+            , path = "/mainnet/epoch/" <> BS.pack (show n)
+            }
+    res <- httpLbs req manager
+    let epoch = deserialiseEpoch decodeBlock (responseBody res)
+    return $ epoch `deepseq` epoch
+
+
+{-------------------------------------------------------------------------------
+                                DESERIALISER
+
+    # Epoch
+
+    Epoch are serialized in pack files that are concatenation of encoded blocks.
+    Each block is encoded as:
+      * A 4 bytes 'size' in big endian
+      * A CBOR blob of 'size' bytes
+      * 0 to 3 bytes of 'alignment' bytes, such that: 'size' + 'alignment' ≡  4
+
+    # Block
+
+    Block are encoded using CBOR, with a format described in 'CBOR DECODERS'
+
+--------------------------------------------------------------------------------}
+
+deserialiseEpoch :: CBOR.Decoder s Block -> BL.ByteString -> [Block]
+deserialiseEpoch decoder = deserialiseEpoch' [] . checkHeader
+  where
+    checkHeader :: BL.ByteString -> BL.ByteString
+    checkHeader bytes =
+        let (magic, filetype, version) =
+                ( BL.take 8 bytes
+                , BL.take 4 $ BL.drop 8 bytes
+                , BL.take 4 $ BL.drop 12 bytes
+                )
+        in
+            if magic == "\254CARDANO" && filetype == "PACK" && version == BL.pack [0,0,0,1] then
+                BL.drop 16 bytes
+            else
+                error $ "INVALID PACK FILE MAGIC: "
+                    <> BL8.unpack magic <> ", "
+                    <> BL8.unpack filetype <> ", "
+                    <> BL8.unpack version
+
+    deserialiseEpoch' :: [Block] -> BL.ByteString -> [Block]
+    deserialiseEpoch' !epoch bytes
+        | BL.null bytes =
+            -- NOTE
+            -- We remove the genesis block has it contains very little information
+            -- for the wallet backend.
+            drop 1 (reverse epoch)
+        | otherwise =
+            let
+                (size, r0) =
+                    first (fromIntegral . word32) $ BL.splitAt 4 bytes
+
+                (blkBytes, r1) =
+                    BL.splitAt size r0
+
+                (Right (_, block)) =
+                    CBOR.deserialiseFromBytes decodeBlock blkBytes
+            in
+                deserialiseEpoch' (block : epoch) (BL.drop (pad size) r1)
+
+    pad :: Int64 -> Int64
+    pad n =
+        -(n `mod` (-4))
+
+    word32 :: BL.ByteString -> Word32
+    word32 bytes = case fromIntegral <$> BL.unpack bytes of
+        [a,b,c,d] ->
+            shiftL a 24 .|. shiftL b 16 .|. shiftL c 8 .|. d
+        _ ->
+            error "deserialiseEpoch.word32: expected exactly 4 bytes!"
 
 
 {-------------------------------------------------------------------------------
@@ -155,10 +296,13 @@ decodeBlock = do
     t <- CBOR.decodeWordCanonical
     case t of
         0 -> do -- Genesis Block
-            error "TODO: Genesis Block"
+            _ <- CBOR.decodeListLenCanonicalOf 3
+            header <- decodeGenesisBlockHeader
+            -- _ <- decodeGenesisBlockBody
+            return $ Block header []
 
         1 -> do -- Main Block
-            CBOR.decodeListLenCanonicalOf 3
+            _ <- CBOR.decodeListLenCanonicalOf 3
             header <- decodeMainBlockHeader
             transactions <- decodeMainBlockBody
             -- _ <- decodeMainExtraData
@@ -208,11 +352,13 @@ decodeDifficulty = do
 
 decodeGenesisBlockHeader :: CBOR.Decoder s BlockHeader
 decodeGenesisBlockHeader = do
-    _ <- CBOR.decodeListLenCanonicalOf 3
+    _ <- CBOR.decodeListLenCanonicalOf 5
+    _ <- decodeProtocolMagic
+    previous <- decodePreviousBlockHeader
     _ <- decodeGenesisProof
     epochIndex <- decodeGenesisConsensusData
     _ <- decodeGenesisExtraData
-    return $ BlockHeader epochIndex 0
+    return $ BlockHeader epochIndex 0 previous
 
 decodeGenesisConsensusData :: CBOR.Decoder s Word64
 decodeGenesisConsensusData = do
@@ -223,6 +369,7 @@ decodeGenesisConsensusData = do
 
 decodeGenesisExtraData :: CBOR.Decoder s ()
 decodeGenesisExtraData = do
+    _ <- CBOR.decodeListLenCanonicalOf 1
     _ <- decodeAttributes
     return ()
 
@@ -262,11 +409,11 @@ decodeMainBlockHeader :: CBOR.Decoder s BlockHeader
 decodeMainBlockHeader = do
     _ <- CBOR.decodeListLenCanonicalOf 5
     _ <- decodeProtocolMagic
-    _ <- decodePreviousBlockHeader
+    previous <- decodePreviousBlockHeader
     _ <- decodeMainProof
     (epochIndex, slotNumber) <- decodeMainConsensusData
     _ <- decodeMainExtraData
-    return $ BlockHeader epochIndex slotNumber
+    return $ BlockHeader epochIndex slotNumber previous
 
 decodeMainConsensusData :: CBOR.Decoder s (Word64, Word16)
 decodeMainConsensusData = do
@@ -311,10 +458,9 @@ decodeOpeningsProof = do
     _ <- CBOR.decodeBytes -- Vss Certificates Hash
     return ()
 
-decodePreviousBlockHeader :: CBOR.Decoder s ()
-decodePreviousBlockHeader = do
-    _ <- CBOR.decodeBytes
-    return ()
+decodePreviousBlockHeader :: CBOR.Decoder s BlockHeaderHash
+decodePreviousBlockHeader =
+    BlockHeaderHash . B16.encode <$> CBOR.decodeBytes
 
 decodeProtocolMagic :: CBOR.Decoder s ()
 decodeProtocolMagic = do
@@ -448,7 +594,6 @@ decodeUpdateProof = do
 
 --------------------------------------------------------------------------------}
 
-
 -- | Inspect the next token that has to be decoded and print it to the console
 -- as a trace. Useful for debugging Decoders.
 -- Example:
@@ -492,3 +637,16 @@ decodeListIndef :: forall s a. CBOR.Decoder s a -> CBOR.Decoder s [a]
 decodeListIndef decodeOne = do
     _ <- CBOR.decodeListLenIndef
     CBOR.decodeSequenceLenIndef (\xs x -> xs ++ [x]) [] id decodeOne
+
+
+{-------------------------------------------------------------------------------
+                                   UTILS
+
+  Project various utils unrelated to any particular business logic.
+--------------------------------------------------------------------------------}
+
+timed :: IO () -> IO ()
+timed io = do
+    start <- getCurrentTime
+    io
+    getCurrentTime >>= \end -> print (diffUTCTime end start)
