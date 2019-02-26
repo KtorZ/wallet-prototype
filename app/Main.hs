@@ -21,8 +21,8 @@ import qualified Crypto.Cipher.ChaChaPoly1305 as Poly
 import           Crypto.Error                 (CryptoError (..),
                                                CryptoFailable (..))
 import           Crypto.Hash                  (hash)
-import           Crypto.Hash.Algorithms       (Blake2b_224, SHA3_256,
-                                               SHA512 (..))
+import           Crypto.Hash.Algorithms       (Blake2b_224, Blake2b_256,
+                                               SHA3_256, SHA512 (..))
 import qualified Crypto.KDF.PBKDF2            as PBKDF2
 import           Data.Aeson                   (ToJSON (..))
 import qualified Data.Aeson                   as Aeson
@@ -42,6 +42,7 @@ import           Data.List                    (intersect, partition)
 import           Data.List.NonEmpty           (NonEmpty (..))
 import           Data.Map.Strict              (Map)
 import qualified Data.Map.Strict              as Map
+import           Data.Proxy                   (Proxy (..))
 import           Data.Set                     (Set, (\\))
 import qualified Data.Set                     as Set
 import qualified Data.Text.Encoding           as T
@@ -65,11 +66,12 @@ import           Cardano.Crypto.Wallet        (ChainCode (..),
 main :: IO ()
 main = runTests *> do
     network <- newNetworkLayer
-    return ()
 
---    epochs <- timed "Get Epochs 0 -> tip" $ traverse (getEpoch network) [0..50]
---
---    let (emptyBlocks, nonEmptyBlocks) = partition (Set.null . transactions) (mconcat epochs)
+    epochs <- timed "Get Epochs 0 -> tip" $ traverse (getEpoch network) [0..0]
+
+    let (emptyBlocks, nonEmptyBlocks) = partition (Set.null . transactions) (mconcat epochs)
+
+    BL8.putStrLn $ Aeson.encodePretty (take 10 nonEmptyBlocks)
 --
 --    putStrLn $ "EMPTY BLOCKS:     " <> show (length emptyBlocks)
 --    putStrLn $ "NON EMPTY BLOCKS: " <> show (length nonEmptyBlocks)
@@ -127,7 +129,8 @@ instance ToJSON BlockHeaderHash where
 
 
 data Tx = Tx
-    { inputs  :: !(Set TxIn)
+    { txId    :: !TxId
+    , inputs  :: !(Set TxIn)
     , outputs :: !(Map Word32 TxOut)
     } deriving (Show, Ord, Eq, Generic)
 
@@ -157,8 +160,8 @@ instance ToJSON TxId where
     toJSON = Aeson.String . T.decodeUtf8 . B16.encode . getTxId
 
 data TxIn = TxIn
-    { txId    :: !TxId
-    , txIndex :: !Word32
+    { inputId :: !TxId
+    , inputIx :: !Word32
     } deriving (Show, Ord, Eq, Generic)
 
 instance NFData TxIn
@@ -216,17 +219,6 @@ instance Dom UTxO where
                            WALLET BUSINESS LOGIC
 --------------------------------------------------------------------------------}
 
--- Assumed to be 'effectively' injective (2.1 UTxO-style Accounting)
-txid :: Tx -> TxId
-txid =
-  error "How to compute a 'unique' identifier from a Transaction (e.g. hashing)?"
-
--- This only satistfies for single-account model
-addressIsOurs :: Address -> Bool
-addressIsOurs =
-  error "How to tell whether an address is ours?"
-
-
 -- * Tx Manipulation
 
 txins :: Set Tx -> Set TxIn
@@ -238,16 +230,20 @@ txutxo =
     Set.foldr' (<>) (UTxO mempty) . Set.map utxo
  where
     utxo :: Tx -> UTxO
-    utxo tx@(Tx _ outs) =
-        UTxO $ Map.mapKeys (TxIn (txid tx)) outs
+    utxo tx@(Tx _ _ outs) =
+        UTxO $ Map.mapKeys (TxIn (txId tx)) outs
 
-txoutsOurs :: Set Tx -> Set TxOut
-txoutsOurs =
+txoutsOurs
+    :: AddressIsOurs s
+    => (Proxy s, AddressIsOursArg s)
+    -> Set Tx
+    -> Set TxOut
+txoutsOurs (proxy, creds) =
     Set.unions . Set.map txoutOurs
  where
     txoutOurs :: Tx -> Set TxOut
-    txoutOurs (Tx _ outs) =
-        Set.filter (addressIsOurs . address) $ Set.fromList $ Map.elems outs
+    txoutOurs (Tx _ _ outs) =
+        Set.filter (addressIsOurs proxy creds . address) $ Set.fromList $ Map.elems outs
 
 
 -- * UTxO Manipulation
@@ -276,19 +272,27 @@ balance :: UTxO -> Coin
 balance (UTxO utxo) =
     mconcat $ map coin $ Map.elems utxo
 
-changeUTxO :: Set Tx -> UTxO
-changeUTxO pending =
+changeUTxO
+    :: AddressIsOurs s
+    => (Proxy s, AddressIsOursArg s)
+    -> Set Tx -> UTxO
+changeUTxO isOurs pending =
     let
-        ours = txoutsOurs pending
+        ours = txoutsOurs isOurs pending
         ins  = txins pending
     in
         (txutxo pending `restrictedTo` ours) `restrictedBy` ins
 
-updateUTxO :: Block -> UTxO -> UTxO
-updateUTxO b utxo =
+updateUTxO
+    :: AddressIsOurs s
+    => (Proxy s, AddressIsOursArg s)
+    -> Block
+    -> UTxO
+    -> UTxO
+updateUTxO isOurs b utxo =
     let
         txs   = transactions b
-        utxo' = txutxo txs `restrictedTo` txoutsOurs txs
+        utxo' = txutxo txs `restrictedTo` txoutsOurs isOurs txs
         ins   = txins txs
     in
         (utxo <> utxo') `excluding` ins
@@ -326,21 +330,34 @@ availableUTxO :: Wallet -> UTxO
 availableUTxO (Wallet utxo pending) =
     utxo `excluding` txins pending
 
-totalUTxO :: Wallet -> UTxO
-totalUTxO wallet@(Wallet _ pending) =
-    availableUTxO wallet <> changeUTxO pending
+totalUTxO
+    :: AddressIsOurs s
+    => (Proxy s, AddressIsOursArg s)
+    -> Wallet
+    -> UTxO
+totalUTxO isOurs wallet@(Wallet _ pending) =
+    availableUTxO wallet <> changeUTxO isOurs pending
 
-totalBalance :: Wallet -> Coin
-totalBalance =
-    balance . totalUTxO
+totalBalance
+    :: AddressIsOurs s
+    => (Proxy s, AddressIsOursArg s)
+    -> Wallet
+    -> Coin
+totalBalance isOurs =
+    balance . totalUTxO isOurs
 
-applyBlock :: Block -> Checkpoints -> Checkpoints
-applyBlock b (Wallet utxo pending :| checkpoints) =
+applyBlock
+    :: AddressIsOurs s
+    => (Proxy s, AddressIsOursArg s)
+    -> Block
+    -> Checkpoints
+    -> Checkpoints
+applyBlock isOurs b (Wallet utxo pending :| checkpoints) =
     invariant applyBlockSafe "applyBlock requires: dom (utxo b) ∩ dom utxo = ∅" $
         Set.null $ dom (txutxo $ transactions b) `Set.intersection` dom utxo
   where
     applyBlockSafe =
-        Wallet (updateUTxO b utxo) (updatePending b pending) :| checkpoints
+        Wallet (updateUTxO isOurs b utxo) (updatePending b pending) :| checkpoints
 
 newPending :: Tx -> Checkpoints -> Checkpoints
 newPending tx (wallet@(Wallet utxo pending) :| checkpoints) =
@@ -571,6 +588,20 @@ instance ToAddress 'Seq where
                              ADDRESS DISCOVERY
 --------------------------------------------------------------------------------}
 
+class AddressIsOurs (scheme :: Scheme) where
+    type AddressIsOursArg scheme :: *
+    addressIsOurs :: Proxy scheme -> AddressIsOursArg scheme -> Address -> Bool
+
+
+-- * Random Derivation
+
+instance AddressIsOurs 'Rnd where
+    type AddressIsOursArg 'Rnd = (Key 'Rnd 'Root0, ByteString)
+    addressIsOurs _ (rootXPrv, passphrase) addr =
+        error "TODO"
+
+
+
 
 {-------------------------------------------------------------------------------
                               NETWORK LAYER
@@ -728,7 +759,7 @@ deserialiseEpoch decoder = deserialiseEpoch' [] . checkHeader
    in handy to debug and see what CBOR is actually expecting behind the scene.
 --------------------------------------------------------------------------------}
 
-decodeAddress :: CBOR.Decoder s Address
+decodeAddress :: CBOR.Decoder s (Address, CBOR.Encoding)
 decodeAddress = do
     _ <- CBOR.decodeListLenCanonicalOf 2 -- CRC Protection Wrapper
     tag <- CBOR.decodeTag -- Myterious hard-coded tag cardano-sl seems to so much like
@@ -741,16 +772,17 @@ decodeAddress = do
     --
     -- NOTE 2:
     -- We may want to check the CRC at this level as-well... maybe not.
-    return $ Address $ CBOR.toStrictByteString $ mempty
-        <> CBOR.encodeListLen 2
-        <> CBOR.encodeTag tag
-        <> CBOR.encodeBytes bytes
-        <> CBOR.encodeWord32 crc
+    let encoding =  mempty
+            <> CBOR.encodeListLen 2
+            <> CBOR.encodeTag tag
+            <> CBOR.encodeBytes bytes
+            <> CBOR.encodeWord32 crc
+    return (Address (CBOR.toStrictByteString encoding), encoding)
 
-decodeAttributes :: CBOR.Decoder s ()
+decodeAttributes :: CBOR.Decoder s ((), CBOR.Encoding)
 decodeAttributes = do
     _ <- CBOR.decodeMapLenCanonical -- Empty map of attributes
-    return ()
+    return ((), CBOR.encodeMapLen 0)
 
 decodeBlock :: CBOR.Decoder s Block
 decodeBlock = do
@@ -998,28 +1030,55 @@ decodeTx :: CBOR.Decoder s (Tx, TxWitness)
 decodeTx = do
     _ <- CBOR.decodeListLenCanonicalOf 2
     _ <- CBOR.decodeListLenCanonicalOf 3
-    inputs <- decodeListIndef decodeTxIn
-    outputs <- decodeListIndef decodeTxOut
-    _ <- decodeAttributes
+    (inputs, encodeInputs) <- unzip <$> decodeListIndef decodeTxIn
+    (outputs, encodeOutputs) <- unzip <$> decodeListIndef decodeTxOut
+    (_, encodeAttributes) <- decodeAttributes
     _ <- decodeList decodeTxWitness
-    return (Tx (Set.fromList inputs) (Map.fromList (zip [0..] outputs)), TxWitness)
+    return
+        ( Tx
+            { inputs = Set.fromList inputs
+            , outputs = Map.fromList (zip [0..] outputs)
+            , txId = TxId $ BA.convert $ hash @_ @Blake2b_256 $ CBOR.toStrictByteString $ mempty
+                <> CBOR.encodeListLen 3
+                <> CBOR.encodeListLenIndef
+                <> mconcat encodeInputs
+                <> CBOR.encodeBreak
+                <> CBOR.encodeListLenIndef
+                <> mconcat encodeOutputs
+                <> CBOR.encodeBreak
+                <> encodeAttributes
+            }
+        , TxWitness
+        )
 
 decodeTxPayload :: CBOR.Decoder s (Set Tx)
 decodeTxPayload = do
     (txs, _) <- unzip <$> decodeListIndef decodeTx
     return $ Set.fromList txs
 
-decodeTxIn :: CBOR.Decoder s TxIn
+-- NOTE
+-- For 'decodeTxIn' and 'decodeTxOut', we also return the raw content that was
+-- just decoded, this allow us to then, reconstruct the encoded tx which is then
+-- used as the transaction id. This way, we don't have to worry much about
+-- representing the Tx as a whole and write the encoder.
+decodeTxIn :: CBOR.Decoder s (TxIn, CBOR.Encoding)
 decodeTxIn = do
     _ <- CBOR.decodeListLenCanonicalOf 2
     t <- CBOR.decodeWord8
     case t of
         0 -> do
-            _ <- CBOR.decodeTag
+            tag <- CBOR.decodeTag
             bytes <- CBOR.decodeBytes
             case CBOR.deserialiseFromBytes decodeTxIn' (BL.fromStrict bytes) of
-                Right (_, input) -> return input
-                Left err         -> fail $ show err
+                Left err -> fail $ show err
+                Right (_, input) -> return
+                    ( input
+                    , mempty
+                        <> CBOR.encodeListLen 2
+                        <> CBOR.encodeWord8 t
+                        <> CBOR.encodeTag tag
+                        <> CBOR.encodeBytes bytes
+                    )
         _ -> fail $ "decodeTxIn: unknown tx input constructor: " <> show t
   where
     decodeTxIn' :: CBOR.Decoder s TxIn
@@ -1029,12 +1088,23 @@ decodeTxIn = do
         index <- CBOR.decodeWord32
         return $ TxIn (TxId txId) index
 
-decodeTxOut :: CBOR.Decoder s TxOut
+-- NOTE
+-- For 'decodeTxIn' and 'decodeTxOut', we also return the raw content that was
+-- just decoded, this allow us to then, reconstruct the encoded tx which is then
+-- used as the transaction id. This way, we don't have to worry much about
+-- representing the Tx as a whole and write the encoder.
+decodeTxOut :: CBOR.Decoder s (TxOut, CBOR.Encoding)
 decodeTxOut = do
     _ <- CBOR.decodeListLenCanonicalOf 2
-    addr <- decodeAddress
+    (addr, encodeAddr) <- decodeAddress
     coin <- CBOR.decodeWord64
-    return $ TxOut addr (Coin coin)
+    return
+        ( TxOut addr (Coin coin)
+        , mempty
+            <> CBOR.encodeListLen 2
+            <> encodeAddr
+            <> CBOR.encodeWord64 coin
+        )
 
 decodeTxProof :: CBOR.Decoder s ()
 decodeTxProof = do
