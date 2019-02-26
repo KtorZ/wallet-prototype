@@ -2,7 +2,7 @@
 
 # Pre-Requisite 
 
-Make sure to download, build and have the [cardano-http-bridge]() running on port 1337.
+Make sure to download, build and have the [cardano-http-bridge](https://github.com/input-output-hk/cardano-http-bridge) running on port 1337.
 
 ```
 $ git clone git@github.com:input-output-hk/cardano-http-bridge.git
