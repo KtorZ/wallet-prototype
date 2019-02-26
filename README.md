@@ -6,7 +6,9 @@ Make sure to download, build and have the [cardano-http-bridge](https://github.c
 
 ```
 $ git clone git@github.com:input-output-hk/cardano-http-bridge.git
-$ cargo run --release --port 1337
+$ cd cardano-http-bridge
+$ git submodule update --init --recursive
+$ cargo run --release -- start --port 1337
 ```
 
 > NOTE:  

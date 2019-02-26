@@ -481,8 +481,7 @@ instance ToAddress 'Rnd where
 cardanoNonce :: ByteString
 cardanoNonce = "serokellfore"
 
--- | Simplified ChaChaPoly encryption used for encrypting the HD payload of the
--- address.
+-- | Simplified ChaChaPoly encryption used for encrypting the HD payload of addresses
 encryptDerPath
     :: ByteString -- Symmetric key / passphrase, 32-byte long
     -> ByteString -- Payload to be encrypted
@@ -651,7 +650,14 @@ _getNetworkTip manager = do
     # Epoch
 
     Epoch are serialized in pack files that are concatenation of encoded blocks.
-    Each block is encoded as:
+
+    A 16-byte header also prefixes all epoch, it contains:
+
+      * An 8-byte 'magic' string
+      * A 4-byte file-type, set to "PACK"
+      * A 4-byte version number, set to 1 at the moment
+
+    Then, each block is encoded as:
       * A 4 bytes 'size' in big endian
       * A CBOR blob of 'size' bytes
       * 0 to 3 bytes of 'alignment' bytes, such that: 'size' + 'alignment' ≡  4
@@ -709,7 +715,7 @@ deserialiseEpoch decoder = deserialiseEpoch' [] . checkHeader
                 -- NOTE
                 -- Careful here when appending blocks to the accumulator 'epoch'
                 -- doing a naive `epoch ++ [block]` has a dramatic impact on the
-                -- complexity. So we better append elements and reverse the list
+                -- complexity. So we better prepend elements and reverse the list
                 -- at the end!
                 deserialiseEpoch' (block : epoch) (BL.drop (pad size) r1)
 
@@ -750,7 +756,7 @@ decodeAddress = do
     bytes <- CBOR.decodeBytes -- Addr Root + Attributes + Type
     crc <- CBOR.decodeWord32 -- CRC
     -- NOTE 1:
-    -- Treating addresses as a blob here, so we just reencod them as such
+    -- Treating addresses as a blob here, so we just ree-ncode them as such
     -- Ultimately for us, addresses are nothing more than a bunch of bytes that
     -- we display in a Base58 format when we have too.
     --
@@ -764,7 +770,7 @@ decodeAddress = do
 
 -- This only makes sense for addresses in the Random scheme; The sequential
 -- scheme has no derivation path and no address payload so-to-speak. So this
--- will just retun 'Nothing' for seq addresses.
+-- will just return 'Nothing' for seq addresses.
 decodeAddressDerivationPath :: ByteString -> CBOR.Decoder s (Maybe (Word32, Word32))
 decodeAddressDerivationPath passphrase = do
     _ <- CBOR.decodeListLenCanonicalOf 3
@@ -818,6 +824,9 @@ decodeBlock = do
             -- protocol updates, slot leaders elections and delegation.
             -- Yet, they don't contain any transaction and we can get away with
             -- a 'mempty' here.
+            -- In theory, we should also:
+            --
+            -- _ <- decodeGenesisBlockBody
             return $ Block header mempty
 
         1 -> do -- Main Block
@@ -1063,11 +1072,6 @@ decodeTxPayload = do
     (txs, _) <- unzip <$> decodeListIndef decodeTx
     return $ Set.fromList txs
 
--- NOTE
--- For 'decodeTxIn' and 'decodeTxOut', we also return the raw content that was
--- just decoded, this allow us to then, reconstruct the encoded tx which is then
--- used as the transaction id. This way, we don't have to worry much about
--- representing the Tx as a whole and write the encoder.
 decodeTxIn :: CBOR.Decoder s TxIn
 decodeTxIn = do
     _ <- CBOR.decodeListLenCanonicalOf 2
@@ -1088,11 +1092,6 @@ decodeTxIn = do
         index <- CBOR.decodeWord32
         return $ TxIn (TxId txId) index
 
--- NOTE
--- For 'decodeTxIn' and 'decodeTxOut', we also return the raw content that was
--- just decoded, this allow us to then, reconstruct the encoded tx which is then
--- used as the transaction id. This way, we don't have to worry much about
--- representing the Tx as a whole and write the encoder.
 decodeTxOut :: CBOR.Decoder s TxOut
 decodeTxOut = do
     _ <- CBOR.decodeListLenCanonicalOf 2
