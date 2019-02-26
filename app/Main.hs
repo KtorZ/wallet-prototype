@@ -8,6 +8,35 @@
 {-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE TypeFamilies        #-}
 
+{-| This module contains some prototypal code for a minimal viable wallet
+   backend. It currently works with the existing Byron chain, and support the
+   following features:
+
+   - Basic Network Interface
+   - Core Wallet Logic (UTxO tracking, Rollbacks, Balance...)
+   - (legacy) Random Address Derivation
+   - Sequential Address Derivation
+   - Random Address Discovery
+   - (almost) Sequential Address Discovery
+
+  Note that a lot of things here aren't in an ideal form. Some types could be
+  refined (for instance, password are usually just raw 'ByteString', and
+  derivation indexes, hardened or not, are plain 'Word32'. Also, many functions
+  are just assumed to succeed and not throw.
+
+  Ideally, this serves multiple purposes:
+
+  - Put the light on some major problems we could encounter once actually implementing this for real
+  - Give a first idea of architecture and design that can fit everything
+  - Allow reasonning to identify area of testing
+  - Remove the dependency with cardano-sl by providing "the way" to implement the various compoenents
+  - Identify some critical parts we may benchmark and control
+
+  /!\ NOTE /!\
+  This file contains actual mnemonic words of test wallet on mainnet. Don't
+  share this and be careful when playing with those.
+-}
+
 module Main where
 
 import qualified Codec.CBOR.Decoding          as CBOR
@@ -64,26 +93,12 @@ import           Cardano.Crypto.Wallet        (ChainCode (..),
 
 
 main :: IO ()
-main = runTests *> do
+main = do
+    runTests
     network <- newNetworkLayer
-
-    epochs <- timed "Get Epochs 0 -> tip" $ traverse (getEpoch network) [0..0]
-
-    let (emptyBlocks, nonEmptyBlocks) = partition (Set.null . transactions) (mconcat epochs)
-
-    BL8.putStrLn $ Aeson.encodePretty (take 10 nonEmptyBlocks)
---
---    putStrLn $ "EMPTY BLOCKS:     " <> show (length emptyBlocks)
---    putStrLn $ "NON EMPTY BLOCKS: " <> show (length nonEmptyBlocks)
---
---    let addrs = map (deriveAddress yoroiXPrv ExternalChain) [0..10]
---            <> map (deriveAddress yoroiXPrv InternalChain) [0..10]
---    let isOurs (Tx _ outs) =
---            not $ null $ intersect addrs (address <$> Map.elems outs)
---
---    timed "concat txs" $ do
---        let txs = filter isOurs (concatMap (Set.toList . transactions) $ mconcat epochs)
---        BL8.putStrLn $ Aeson.encodePretty txs
+    epochs <- syncWithMainnet network
+    restoreDaedalusWallet epochs >>= prettyPrint
+    restoreYoroiWallet epochs >>= prettyPrint
 
 
 {-------------------------------------------------------------------------------
@@ -129,8 +144,7 @@ instance ToJSON BlockHeaderHash where
 
 
 data Tx = Tx
-    { txId    :: !TxId
-    , inputs  :: !(Set TxIn)
+    { inputs  :: !(Set TxIn)
     , outputs :: !(Map Word32 TxOut)
     } deriving (Show, Ord, Eq, Generic)
 
@@ -219,6 +233,13 @@ instance Dom UTxO where
                            WALLET BUSINESS LOGIC
 --------------------------------------------------------------------------------}
 
+
+-- | Assumed to be effectively injective
+txId :: Tx -> TxId
+txId =
+    TxId . BA.convert . hash @_ @Blake2b_256 . CBOR.toStrictByteString . encodeTx
+
+
 -- * Tx Manipulation
 
 txins :: Set Tx -> Set TxIn
@@ -230,7 +251,7 @@ txutxo =
     Set.foldr' (<>) (UTxO mempty) . Set.map utxo
  where
     utxo :: Tx -> UTxO
-    utxo tx@(Tx _ _ outs) =
+    utxo tx@(Tx _ outs) =
         UTxO $ Map.mapKeys (TxIn (txId tx)) outs
 
 txoutsOurs
@@ -242,7 +263,7 @@ txoutsOurs (proxy, creds) =
     Set.unions . Set.map txoutOurs
  where
     txoutOurs :: Tx -> Set TxOut
-    txoutOurs (Tx _ _ outs) =
+    txoutOurs (Tx _ outs) =
         Set.filter (addressIsOurs proxy creds . address) $ Set.fromList $ Map.elems outs
 
 
@@ -380,7 +401,7 @@ rollback = \case
 --------------------------------------------------------------------------------}
 
 -- We introduce some phantom types here to force disctinction between the
--- various key types we have.
+-- various key types we have; just to remove some confusion in type signatures
 newtype Key (scheme :: Scheme) (level :: Depth) = Key { getKey :: XPrv }
 
 data Scheme
@@ -448,55 +469,13 @@ data RandomAddressArgs = RandomAddressArgs
 
 instance ToAddress 'Rnd where
     type ToAddressArgs 'Rnd = RandomAddressArgs
-    toAddress (Key xprv) (RandomAddressArgs rndAccountIx rndAddressIx rndRootXPrv) = Address $
-        CBOR.toStrictByteString $ mempty
-            <> CBOR.encodeListLen 2
-            <> CBOR.encodeTag 24 -- Hard-Coded Tag value in cardano-sl
-            <> CBOR.encodeBytes payload
-            <> CBOR.encodeWord32 (crc32 payload)
+    toAddress (Key xprv) (RandomAddressArgs rndAccountIx rndAddressIx rndRootXPrv) =
+        Address $ CBOR.toStrictByteString $ encodeAddress (toXPub xprv) encodeAttributes
       where
-        payload = CBOR.toStrictByteString $ mempty
-            <> CBOR.encodeListLen 3
-            <> CBOR.encodeBytes root
-            <> encodeAttributes
-            <> CBOR.encodeWord8 0 -- Address Type, 0 = Public Key
-
-        root = BA.convert $ hash @_ @Blake2b_224 $ hash @_ @SHA3_256 $ CBOR.toStrictByteString $ mempty
-            <> CBOR.encodeListLen 3
-            <> CBOR.encodeWord8 0 -- Address Type, 0 = Public Key
-            <> encodeSpendingData
-            <> encodeAttributes
-
-        passphrase (Key rootXPrv) = PBKDF2.generate
-            (PBKDF2.prfHMAC SHA512)
-            (PBKDF2.Parameters 500 32)
-            (unXPub $ toXPub rootXPrv)
-            ("address-hashing" :: ByteString)
-
-        encodeXPub (XPub pub (ChainCode cc)) =
-            CBOR.encodeBytes (pub <> cc)
-
-        encodeSpendingData = CBOR.encodeListLen 2
-            <> CBOR.encodeWord8 0
-            <> encodeXPub (toXPub xprv)
-
-        encodeAttributes = CBOR.encodeMapLen 1
+        encodeAttributes = mempty
+            <> CBOR.encodeMapLen 1
             <> CBOR.encodeWord8 1
-            <> encodeDerivationPath (passphrase rndRootXPrv)
-
-        encodeDerivationPath passphrase =
-            let
-                path = CBOR.toStrictByteString $ mempty
-                    <> CBOR.encodeListLenIndef
-                    <> CBOR.encodeWord32 rndAccountIx
-                    <> CBOR.encodeWord32 rndAddressIx
-                    <> CBOR.encodeBreak
-            in
-                case encryptDerPath passphrase path of
-                    CryptoPassed a ->
-                        CBOR.encodeBytes $ CBOR.toStrictByteString $ CBOR.encodeBytes a
-                    CryptoFailed e ->
-                        error $ "toAddress.encodeDerivationPath : " <> show e
+            <> encodeDerivationPath (hdPassphrase rndRootXPrv) rndAccountIx rndAddressIx
 
 -- | Gotta love Serokell hard-coded nonce :) .. Kill me now.
 cardanoNonce :: ByteString
@@ -525,6 +504,13 @@ decryptDerPath passphrase bytes = do
     let (out, st2) = Poly.decrypt payload st1
     when (BA.convert (Poly.finalize st2) /= tag) $ CryptoFailed CryptoError_MacKeyInvalid
     return out
+
+hdPassphrase :: Key 'Rnd 'Root0 -> ByteString
+hdPassphrase (Key rootXPrv) = PBKDF2.generate
+    (PBKDF2.prfHMAC SHA512)
+    (PBKDF2.Parameters 500 32)
+    (unXPub $ toXPub rootXPrv)
+    ("address-hashing" :: ByteString)
 
 
 -- * Sequential Derivation
@@ -556,32 +542,10 @@ instance HierarchicalDerivation 'Seq where
 
 instance ToAddress 'Seq where
     type ToAddressArgs 'Seq = ()
-    toAddress (Key xprv) () = Address $ CBOR.toStrictByteString $ mempty
-        <> CBOR.encodeListLen 2
-        <> CBOR.encodeTag 24 -- Hard-Coded Tag value in cardano-sl
-        <> CBOR.encodeBytes payload
-        <> CBOR.encodeWord32 (crc32 payload)
+    toAddress (Key xprv) () =
+        Address $ CBOR.toStrictByteString $ encodeAddress (toXPub xprv) encodeAttributes
       where
-        payload = CBOR.toStrictByteString $ mempty
-            <> CBOR.encodeListLen 3
-            <> CBOR.encodeBytes root
-            <> encodeAttributes
-            <> CBOR.encodeWord8 0 -- Address Type, 0 = Public Key
-
-        root = BA.convert $ hash @_ @Blake2b_224 $ hash @_ @SHA3_256 $ CBOR.toStrictByteString $ mempty
-            <> CBOR.encodeListLen 3
-            <> CBOR.encodeWord8 0 -- Address Type, 0 = Public Key
-            <> encodeSpendingData
-            <> encodeAttributes
-
-        encodeXPub (XPub pub (ChainCode cc)) =
-            CBOR.encodeBytes (pub <> cc)
-
-        encodeSpendingData = CBOR.encodeListLen 2
-            <> CBOR.encodeWord8 0
-            <> encodeXPub (toXPub xprv)
-
-        encodeAttributes = CBOR.encodeMapLen 0
+        encodeAttributes = mempty <> CBOR.encodeMapLen 0
 
 
 {-------------------------------------------------------------------------------
@@ -596,15 +560,35 @@ class AddressIsOurs (scheme :: Scheme) where
 -- * Random Derivation
 
 instance AddressIsOurs 'Rnd where
-    type AddressIsOursArg 'Rnd = (Key 'Rnd 'Root0, ByteString)
-    addressIsOurs _ (rootXPrv, passphrase) addr =
-        error "TODO"
+    type AddressIsOursArg 'Rnd = ByteString
+    addressIsOurs _ passphrase (Address bytes) =
+        let
+            payload = unsafeDeserialiseFromBytes decodeAddressPayload (BL.fromStrict bytes)
+        in
+        case unsafeDeserialiseFromBytes (decodeAddressDerivationPath passphrase) (BL.fromStrict payload) of
+            Just (_, _) -> True
+            _           -> False
 
 
+-- * Sequential Derivation
+
+-- Address Pool Discovery in a VERY simplistic form. We've just generated
+-- "all" the addresses upfront and look them up in the list.
+-- In order to properly implement that, we'll to make 'AddressIsOurs' stateful
+-- (i.e. return the 'AddressIsOursArg scheme' with the Bool) which requires a
+-- bit of fiddling with the wallet core logic.
+instance AddressIsOurs 'Seq where
+    type AddressIsOursArg 'Seq = [Address]
+    addressIsOurs _ pool addr = addr `elem` pool
 
 
 {-------------------------------------------------------------------------------
                               NETWORK LAYER
+
+  A very simple networking stack that assumes that there's the cardano-http-bridge
+  running on port 1337. We define here a small interface as the 'NetworkLayer'
+  so in theory, anything implementing that interface would work with the rest of
+  the code.
 --------------------------------------------------------------------------------}
 
 data NetworkLayer = NetworkLayer
@@ -759,7 +743,7 @@ deserialiseEpoch decoder = deserialiseEpoch' [] . checkHeader
    in handy to debug and see what CBOR is actually expecting behind the scene.
 --------------------------------------------------------------------------------}
 
-decodeAddress :: CBOR.Decoder s (Address, CBOR.Encoding)
+decodeAddress :: CBOR.Decoder s Address
 decodeAddress = do
     _ <- CBOR.decodeListLenCanonicalOf 2 -- CRC Protection Wrapper
     tag <- CBOR.decodeTag -- Myterious hard-coded tag cardano-sl seems to so much like
@@ -772,12 +756,47 @@ decodeAddress = do
     --
     -- NOTE 2:
     -- We may want to check the CRC at this level as-well... maybe not.
-    let encoding =  mempty
-            <> CBOR.encodeListLen 2
-            <> CBOR.encodeTag tag
-            <> CBOR.encodeBytes bytes
-            <> CBOR.encodeWord32 crc
-    return (Address (CBOR.toStrictByteString encoding), encoding)
+    return $ Address $ CBOR.toStrictByteString $ mempty
+        <> CBOR.encodeListLen 2
+        <> CBOR.encodeTag tag
+        <> CBOR.encodeBytes bytes
+        <> CBOR.encodeWord32 crc
+
+-- This only makes sense for addresses in the Random scheme; The sequential
+-- scheme has no derivation path and no address payload so-to-speak. So this
+-- will just retun 'Nothing' for seq addresses.
+decodeAddressDerivationPath :: ByteString -> CBOR.Decoder s (Maybe (Word32, Word32))
+decodeAddressDerivationPath passphrase = do
+    _ <- CBOR.decodeListLenCanonicalOf 3
+    _ <- CBOR.decodeBytes
+    l <- CBOR.decodeMapLen
+    case l of
+        1 -> do
+            _ <- CBOR.decodeWord8
+            bytes <- unsafeDeserialiseFromBytes CBOR.decodeBytes . BL.fromStrict <$> CBOR.decodeBytes
+            case decryptDerPath passphrase bytes of
+                CryptoFailed _ ->
+                    return Nothing
+                CryptoPassed moarBytes -> do
+                    let (Right (_, result)) = CBOR.deserialiseFromBytes decodeDerPath (BL.fromStrict moarBytes)
+                    return result
+        _ ->
+            return Nothing
+  where
+    decodeDerPath :: CBOR.Decoder s (Maybe (Word32, Word32))
+    decodeDerPath = do
+        path <- decodeListIndef CBOR.decodeWord32
+        case path of
+            [accIx, addrIx] -> return $ Just (accIx, addrIx)
+            _               -> return Nothing
+
+decodeAddressPayload :: CBOR.Decoder s ByteString
+decodeAddressPayload = do
+    _ <- CBOR.decodeListLenCanonicalOf 2
+    _ <- CBOR.decodeTag
+    bytes <- CBOR.decodeBytes
+    _ <- CBOR.decodeWord32 -- CRC
+    return bytes
 
 decodeAttributes :: CBOR.Decoder s ((), CBOR.Encoding)
 decodeAttributes = do
@@ -1030,24 +1049,12 @@ decodeTx :: CBOR.Decoder s (Tx, TxWitness)
 decodeTx = do
     _ <- CBOR.decodeListLenCanonicalOf 2
     _ <- CBOR.decodeListLenCanonicalOf 3
-    (inputs, encodeInputs) <- unzip <$> decodeListIndef decodeTxIn
-    (outputs, encodeOutputs) <- unzip <$> decodeListIndef decodeTxOut
-    (_, encodeAttributes) <- decodeAttributes
+    inputs <- decodeListIndef decodeTxIn
+    outputs <- decodeListIndef decodeTxOut
+    _ <- decodeAttributes
     _ <- decodeList decodeTxWitness
     return
-        ( Tx
-            { inputs = Set.fromList inputs
-            , outputs = Map.fromList (zip [0..] outputs)
-            , txId = TxId $ BA.convert $ hash @_ @Blake2b_256 $ CBOR.toStrictByteString $ mempty
-                <> CBOR.encodeListLen 3
-                <> CBOR.encodeListLenIndef
-                <> mconcat encodeInputs
-                <> CBOR.encodeBreak
-                <> CBOR.encodeListLenIndef
-                <> mconcat encodeOutputs
-                <> CBOR.encodeBreak
-                <> encodeAttributes
-            }
+        ( Tx (Set.fromList inputs) (Map.fromList (zip [0..] outputs))
         , TxWitness
         )
 
@@ -1061,7 +1068,7 @@ decodeTxPayload = do
 -- just decoded, this allow us to then, reconstruct the encoded tx which is then
 -- used as the transaction id. This way, we don't have to worry much about
 -- representing the Tx as a whole and write the encoder.
-decodeTxIn :: CBOR.Decoder s (TxIn, CBOR.Encoding)
+decodeTxIn :: CBOR.Decoder s TxIn
 decodeTxIn = do
     _ <- CBOR.decodeListLenCanonicalOf 2
     t <- CBOR.decodeWord8
@@ -1070,15 +1077,8 @@ decodeTxIn = do
             tag <- CBOR.decodeTag
             bytes <- CBOR.decodeBytes
             case CBOR.deserialiseFromBytes decodeTxIn' (BL.fromStrict bytes) of
-                Left err -> fail $ show err
-                Right (_, input) -> return
-                    ( input
-                    , mempty
-                        <> CBOR.encodeListLen 2
-                        <> CBOR.encodeWord8 t
-                        <> CBOR.encodeTag tag
-                        <> CBOR.encodeBytes bytes
-                    )
+                Left err         -> fail $ show err
+                Right (_, input) -> return input
         _ -> fail $ "decodeTxIn: unknown tx input constructor: " <> show t
   where
     decodeTxIn' :: CBOR.Decoder s TxIn
@@ -1093,18 +1093,12 @@ decodeTxIn = do
 -- just decoded, this allow us to then, reconstruct the encoded tx which is then
 -- used as the transaction id. This way, we don't have to worry much about
 -- representing the Tx as a whole and write the encoder.
-decodeTxOut :: CBOR.Decoder s (TxOut, CBOR.Encoding)
+decodeTxOut :: CBOR.Decoder s TxOut
 decodeTxOut = do
     _ <- CBOR.decodeListLenCanonicalOf 2
-    (addr, encodeAddr) <- decodeAddress
+    addr <- decodeAddress
     coin <- CBOR.decodeWord64
-    return
-        ( TxOut addr (Coin coin)
-        , mempty
-            <> CBOR.encodeListLen 2
-            <> encodeAddr
-            <> CBOR.encodeWord64 coin
-        )
+    return $ TxOut addr (Coin coin)
 
 decodeTxProof :: CBOR.Decoder s ()
 decodeTxProof = do
@@ -1129,6 +1123,95 @@ decodeUpdateProof :: CBOR.Decoder s ()
 decodeUpdateProof = do
     _ <- CBOR.decodeBytes -- Update Hash
     return ()
+
+
+
+{-------------------------------------------------------------------------------
+                              CBOR ENCODERS
+
+    Ideally at some point, we do want roundtrip tests between encoders and
+    decoders ...
+--------------------------------------------------------------------------------}
+
+encodeAddress :: XPub -> CBOR.Encoding -> CBOR.Encoding
+encodeAddress (XPub pub (ChainCode cc)) encodeAttributes =
+    encodeAddressPayload payload
+  where
+    payload = CBOR.toStrictByteString $ mempty
+        <> CBOR.encodeListLen 3
+        <> CBOR.encodeBytes root
+        <> encodeAttributes
+        <> CBOR.encodeWord8 0 -- Address Type, 0 = Public Key
+
+    root = BA.convert $ hash @_ @Blake2b_224 $ hash @_ @SHA3_256 $ CBOR.toStrictByteString $ mempty
+        <> CBOR.encodeListLen 3
+        <> CBOR.encodeWord8 0 -- Address Type, 0 = Public Key
+        <> encodeSpendingData
+        <> encodeAttributes
+
+    encodeXPub =
+        CBOR.encodeBytes (pub <> cc)
+
+    encodeSpendingData = CBOR.encodeListLen 2
+        <> CBOR.encodeWord8 0
+        <> encodeXPub
+
+encodeAddressPayload :: ByteString -> CBOR.Encoding
+encodeAddressPayload payload = mempty
+    <> CBOR.encodeListLen 2
+    <> CBOR.encodeTag 24 -- Hard-Coded Tag value in cardano-sl
+    <> CBOR.encodeBytes payload
+    <> CBOR.encodeWord32 (crc32 payload)
+
+encodeAttributes :: CBOR.Encoding
+encodeAttributes = mempty
+    <> CBOR.encodeMapLen 0
+
+encodeDerivationPath :: ByteString -> Word32 -> Word32 -> CBOR.Encoding
+encodeDerivationPath passphrase accIx addrIx =
+    let
+        path = CBOR.toStrictByteString $ mempty
+            <> CBOR.encodeListLenIndef
+            <> CBOR.encodeWord32 accIx
+            <> CBOR.encodeWord32 addrIx
+            <> CBOR.encodeBreak
+    in
+        case encryptDerPath passphrase path of
+            CryptoPassed a ->
+                CBOR.encodeBytes $ CBOR.toStrictByteString $ CBOR.encodeBytes a
+            CryptoFailed e ->
+                error $ "encodeDerivationPath : " <> show e
+
+encodeTx :: Tx -> CBOR.Encoding
+encodeTx tx = mempty
+    <> CBOR.encodeListLen 3
+    <> CBOR.encodeListLenIndef
+    <> mconcat (encodeTxIn <$> Set.toList (inputs tx))
+    <> CBOR.encodeBreak
+    <> CBOR.encodeListLenIndef
+    <> mconcat (encodeTxOut <$> Map.elems (outputs tx))
+    <> CBOR.encodeBreak
+    <> encodeAttributes
+
+encodeTxIn :: TxIn -> CBOR.Encoding
+encodeTxIn (TxIn (TxId txid) ix) = mempty
+    <> CBOR.encodeListLen 2
+    <> CBOR.encodeWord8 0
+    <> CBOR.encodeTag 24
+    <> CBOR.encodeBytes bytes
+  where
+    bytes = CBOR.toStrictByteString $ mempty
+        <> CBOR.encodeListLen 2
+        <> CBOR.encodeBytes txid
+        <> CBOR.encodeWord32 ix
+
+encodeTxOut :: TxOut -> CBOR.Encoding
+encodeTxOut (TxOut (Address addr) (Coin coin)) = mempty
+    <> CBOR.encodeListLen 2
+    <> encodeAddressPayload payload
+    <> CBOR.encodeWord64 coin
+  where
+    payload = unsafeDeserialiseFromBytes decodeAddressPayload (BL.fromStrict addr)
 
 
 {-------------------------------------------------------------------------------
@@ -1201,6 +1284,10 @@ invariant :: a -> String -> Bool -> a
 invariant next msg predicate =
   if predicate then next else error msg
 
+prettyPrint :: ToJSON a => a -> IO ()
+prettyPrint =
+    BL8.putStrLn . Aeson.encodePretty
+
 
 {-------------------------------------------------------------------------------
                                    TESTING
@@ -1210,6 +1297,29 @@ invariant next msg predicate =
   generate and encode addresses correctly, comparing to what's on cardano-sl
   and cardano-wallet already.
 --------------------------------------------------------------------------------}
+
+syncWithMainnet :: NetworkLayer -> IO [[Block]]
+syncWithMainnet network = timed "Sync With Mainnet" $ do
+    tip <- getNetworkTip network
+    traverse (getEpoch network) [0..(fromIntegral (epochIndex tip) - 1)]
+
+restoreDaedalusWallet :: [[Block]] -> IO [Address]
+restoreDaedalusWallet epochs = timed "Restore Daedalus Wallet" $ do
+    let addresses = map address $ concatMap (Map.elems . outputs) $ concatMap (Set.toList . transactions) (mconcat epochs)
+    let isOurs = addressIsOurs (Proxy :: Proxy Rnd) (hdPassphrase $ Key daedalusXPrv)
+    return $ filter isOurs addresses
+
+restoreYoroiWallet :: [[Block]] -> IO [Address]
+restoreYoroiWallet epochs = timed "Restore Yoroi Wallet" $ do
+    let addresses = map address $ concatMap (Map.elems . outputs) $ concatMap (Set.toList . transactions) (mconcat epochs)
+    -- Quick'n'dirty Pool Generation, will refine later. We just generate a
+    -- bunch of addresses from the first accounts. In practice, we do want to
+    -- respect the gap and generate addresses as we discover them.
+    let pool =
+            map (\n -> genYoroiAddr 0x80000000 n InternalChain) [0..100] <>
+            map (\n -> genYoroiAddr 0x80000000 n ExternalChain) [0..100]
+    let isOurs = addressIsOurs (Proxy :: Proxy Seq) pool
+    return $ filter isOurs addresses
 
 runTests :: IO ()
 runTests = do
@@ -1225,71 +1335,75 @@ chachapolyRountrip = do
 addressGoldenTest :: IO ()
 addressGoldenTest = do
     invariant (return ()) "Address Golden Test - Yoroi 0'/0/0" $
-        genYoroiAddr 0x80000000 0 ExternalChain == toJSON ("Ae2tdPwUPEZLLeQYaBmNXiwrv9Mf13eauCxgHxZYF1EhDKMTKR5t1dFrSCU" :: String)
+        toJSON (genYoroiAddr 0x80000000 0 ExternalChain) == toJSON ("Ae2tdPwUPEZLLeQYaBmNXiwrv9Mf13eauCxgHxZYF1EhDKMTKR5t1dFrSCU" :: String)
 
     invariant (return ()) "Address Golden Test - Yoroi 0'/1/0" $
-        genYoroiAddr 0x80000000 0 InternalChain == toJSON ("Ae2tdPwUPEZ9qDt13UhqJmNUALW56V9KhErnTAMsUwV4qm33CzfEmLP3tfP" :: String)
+        toJSON (genYoroiAddr 0x80000000 0 InternalChain) == toJSON ("Ae2tdPwUPEZ9qDt13UhqJmNUALW56V9KhErnTAMsUwV4qm33CzfEmLP3tfP" :: String)
 
     invariant (return ()) "Address Golden Test - Yoroi 0'/0/14" $
-        genYoroiAddr 0x80000000 14 ExternalChain == toJSON ("Ae2tdPwUPEZ6JkktL91gdeAEZrwxVyDfxE5GTJ9LLCnogcpe3GPd48m4Fir" :: String)
+        toJSON (genYoroiAddr 0x80000000 14 ExternalChain) == toJSON ("Ae2tdPwUPEZ6JkktL91gdeAEZrwxVyDfxE5GTJ9LLCnogcpe3GPd48m4Fir" :: String)
 
     invariant (return ()) "Address Golden Test - Yoroi 0'/1/14" $
-        genYoroiAddr 0x80000000 14 InternalChain == toJSON ("Ae2tdPwUPEZEAgMFTZ3XvXupMJnbrKNxCtmBG4Ry4qBHYgCxe7T98fxr7uw" :: String)
+        toJSON (genYoroiAddr 0x80000000 14 InternalChain) == toJSON ("Ae2tdPwUPEZEAgMFTZ3XvXupMJnbrKNxCtmBG4Ry4qBHYgCxe7T98fxr7uw" :: String)
 
     invariant (return ()) "Address Golden Test - Yoroi 14'/0/0" $
-        genYoroiAddr 0x8000000E 0 ExternalChain == toJSON ("Ae2tdPwUPEZKCUMsknNU6FmV59dXGgHamS5cEfH6AR6u7bq5Y5RaneTBqBH" :: String)
+        toJSON (genYoroiAddr 0x8000000E 0 ExternalChain) == toJSON ("Ae2tdPwUPEZKCUMsknNU6FmV59dXGgHamS5cEfH6AR6u7bq5Y5RaneTBqBH" :: String)
 
     invariant (return ()) "Address Golden Test - Yoroi 14'/1/0" $
-        genYoroiAddr 0x8000000E 0 InternalChain == toJSON ("Ae2tdPwUPEZ726BqcPdWdzSN42tPSu9Ryx4qEU9FBTLfBW8g5DU76FTn9Eo" :: String)
+        toJSON (genYoroiAddr 0x8000000E 0 InternalChain) == toJSON ("Ae2tdPwUPEZ726BqcPdWdzSN42tPSu9Ryx4qEU9FBTLfBW8g5DU76FTn9Eo" :: String)
 
     invariant (return ()) "Address Golden Test - Yoroi 14'/0/42" $
-        genYoroiAddr 0x8000000E 42 ExternalChain == toJSON ("Ae2tdPwUPEZGHqe3aWWBEGav6V6BuBZmB9XfQADZz6eagBaPZJCAtVrjXe2" :: String)
+        toJSON (genYoroiAddr 0x8000000E 42 ExternalChain) == toJSON ("Ae2tdPwUPEZGHqe3aWWBEGav6V6BuBZmB9XfQADZz6eagBaPZJCAtVrjXe2" :: String)
 
     invariant (return ()) "Address Golden Test - Yoroi 14'/1/42" $
-        genYoroiAddr 0x8000000E 42 InternalChain == toJSON ("Ae2tdPwUPEZD6w2iqeQCyQt5dEhCnxwB5kooG8k2HhDoVc3myuHKWiD3fWi" :: String)
+        toJSON (genYoroiAddr 0x8000000E 42 InternalChain) == toJSON ("Ae2tdPwUPEZD6w2iqeQCyQt5dEhCnxwB5kooG8k2HhDoVc3myuHKWiD3fWi" :: String)
 
     invariant (return ()) "Address Golden Test - Daedalus 0'/0" $
-        genDaedalusAddr 0x80000000 0 == toJSON ("2w1sdSJu3GViq5Rx3xYMS8twmKen9tQNya7DqHfQPzg5f6Lc6EXpDKoWA3wjiUk6dvN8bnUHZfhcSTXxkyHqBnzv7M15w52xJbq" :: String)
+        toJSON (genDaedalusAddr 0x80000000 0) == toJSON ("2w1sdSJu3GViq5Rx3xYMS8twmKen9tQNya7DqHfQPzg5f6Lc6EXpDKoWA3wjiUk6dvN8bnUHZfhcSTXxkyHqBnzv7M15w52xJbq" :: String)
 
     invariant (return ()) "Address Golden Test - Daedalus 0'/14" $
-        genDaedalusAddr 0x80000000 14 == toJSON ("2w1sdSJu3GVhSLVv1Yh7wmBT67tZ2KaXKEMFVUSy6rZnYbCJRjywkDSiU9ZZggvYSBK2hZ4C4MsaPwTJiKq99LvzYDmKgRgTBjF" :: String)
+        toJSON (genDaedalusAddr 0x80000000 14) == toJSON ("2w1sdSJu3GVhSLVv1Yh7wmBT67tZ2KaXKEMFVUSy6rZnYbCJRjywkDSiU9ZZggvYSBK2hZ4C4MsaPwTJiKq99LvzYDmKgRgTBjF" :: String)
 
     invariant (return ()) "Address Golden Test - Daedalus 14'/0" $
-        genDaedalusAddr 0x8000000E 0 == toJSON ("2w1sdSJu3GVieSGggHVpLxhgeh8Kno7oaBPyTFiKYJejSAMQ3vv1j2Lsx2jSTnuRgVgXbwtbTUUUmqJtitTAoUXJxKgZKJaYxFr" :: String)
+        toJSON (genDaedalusAddr 0x8000000E 0) == toJSON ("2w1sdSJu3GVieSGggHVpLxhgeh8Kno7oaBPyTFiKYJejSAMQ3vv1j2Lsx2jSTnuRgVgXbwtbTUUUmqJtitTAoUXJxKgZKJaYxFr" :: String)
 
     invariant (return ()) "Address Golden Test - Daedalus 14'/42" $
-        genDaedalusAddr 0x8000000E 42 == toJSON ("9XQrTpiaBYn6K5uDNHphfxRXnGk3DMn7qDgxp2LditeMjueMhnYRmWmEbsUVsCodE3SJ6LQWzyVb51MYVp1pu2mAHJChz7UPJg4t" :: String)
-  where
-    genYoroiAddr accIx addrIx changeChain =
-        let
-            rootXPrv = Key yoroiXPrv :: Key 'Seq 'Root0
-            acctXPrv = deriveAccountPrivateKey mempty rootXPrv accIx
-            addrXPrv = deriveAddressPrivateKey mempty acctXPrv changeChain addrIx
-        in
-            toJSON $ toAddress addrXPrv ()
+        toJSON (genDaedalusAddr 0x8000000E 42) == toJSON ("9XQrTpiaBYn6K5uDNHphfxRXnGk3DMn7qDgxp2LditeMjueMhnYRmWmEbsUVsCodE3SJ6LQWzyVb51MYVp1pu2mAHJChz7UPJg4t" :: String)
 
-    genDaedalusAddr accIx addrIx =
-        let
-            rootXPrv = Key daedalusXPrv :: Key 'Rnd 'Root0
-            acctXPrv = deriveAccountPrivateKey mempty rootXPrv accIx
-            addrXPrv = deriveAddressPrivateKey mempty acctXPrv undefined addrIx
-        in
-            toJSON $ toAddress addrXPrv $ RandomAddressArgs
-                { rndAccountIx = accIx
-                , rndAddressIx = addrIx
-                , rndRootXPrv  = rootXPrv
-                }
 
-    -- | A root private key using the sequential scheme on MAINNET.
-    -- Kindly by Patrick from QA.
-    yoroiXPrv :: XPrv
-    yoroiXPrv = generateNew @ByteString @ByteString @ByteString
-        "v\190\235Y\179#\181s]M\214\142g\178\245\DC4\226\220\f\167"
-        mempty
-        mempty
+genYoroiAddr :: Word32 -> Word32 -> ChangeChain -> Address
+genYoroiAddr accIx addrIx changeChain =
+    let
+        rootXPrv = Key yoroiXPrv :: Key 'Seq 'Root0
+        acctXPrv = deriveAccountPrivateKey mempty rootXPrv accIx
+        addrXPrv = deriveAddressPrivateKey mempty acctXPrv changeChain addrIx
+    in
+        toAddress addrXPrv ()
 
-    -- | A root private key using the random scheme on MAINNET.
-    -- Kindly provided by Alan from QA.
-    daedalusXPrv = generate @ByteString @ByteString
-        "X >\178\ETB\DLE\GSg\226\192\198z\131\189\186\220(A+\247\204h\253\235\&5\SUB\CAN\176g\223\212c|f"
-        mempty
+genDaedalusAddr :: Word32 -> Word32 -> Address
+genDaedalusAddr accIx addrIx =
+    let
+        rootXPrv = Key daedalusXPrv :: Key 'Rnd 'Root0
+        acctXPrv = deriveAccountPrivateKey mempty rootXPrv accIx
+        addrXPrv = deriveAddressPrivateKey mempty acctXPrv undefined addrIx
+    in
+        toAddress addrXPrv $ RandomAddressArgs
+            { rndAccountIx = accIx
+            , rndAddressIx = addrIx
+            , rndRootXPrv  = rootXPrv
+            }
+
+-- | A root private key using the sequential scheme on MAINNET.
+-- Kindly by Patrick from QA.
+yoroiXPrv :: XPrv
+yoroiXPrv = generateNew @ByteString @ByteString @ByteString
+    "v\190\235Y\179#\181s]M\214\142g\178\245\DC4\226\220\f\167"
+    mempty
+    mempty
+
+-- | A root private key using the random scheme on MAINNET.
+-- Kindly provided by Alan from QA.
+daedalusXPrv :: XPrv
+daedalusXPrv = generate @ByteString @ByteString
+    "X >\178\ETB\DLE\GSg\226\192\198z\131\189\186\220(A+\247\204h\253\235\&5\SUB\CAN\176g\223\212c|f"
+    mempty
