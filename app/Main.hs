@@ -1,8 +1,11 @@
 {-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications    #-}
+{-# LANGUAGE TypeFamilies        #-}
 
 module Main where
 
@@ -13,19 +16,27 @@ import qualified Codec.CBOR.Write           as CBOR
 import           Control.Arrow              (first)
 import           Control.DeepSeq            (NFData, deepseq)
 import           Control.Monad              (void)
-import           Control.Monad.State.Strict (State, evalState, get, modify,
-                                             state)
+import           Crypto.Hash                (hash)
+import           Crypto.Hash.Algorithms     (Blake2b_224, SHA3_256)
 import           Data.Aeson                 (ToJSON (..))
 import qualified Data.Aeson                 as Aeson
 import qualified Data.Aeson.Encode.Pretty   as Aeson
 import           Data.Bits                  (shiftL, (.|.))
+import           Data.ByteArray             (convert)
 import           Data.ByteString            (ByteString)
 import qualified Data.ByteString.Base16     as B16
 import           Data.ByteString.Base58     (bitcoinAlphabet, encodeBase58)
 import qualified Data.ByteString.Char8      as BS
 import qualified Data.ByteString.Lazy       as BL
 import qualified Data.ByteString.Lazy.Char8 as BL8
+import           Data.Digest.CRC32          (crc32)
 import           Data.Int                   (Int64)
+import           Data.List                  (intersect)
+import           Data.List.NonEmpty         (NonEmpty (..))
+import           Data.Map.Strict            (Map)
+import qualified Data.Map.Strict            as Map
+import           Data.Set                   (Set, (\\))
+import qualified Data.Set                   as Set
 import qualified Data.Text.Encoding         as T
 import           Data.Time.Clock            (diffUTCTime, getCurrentTime)
 import           Data.Word                  (Word16, Word32, Word64)
@@ -36,20 +47,52 @@ import           Network.HTTP.Client        (Manager, defaultRequest, httpLbs,
                                              responseStatus)
 import qualified Network.HTTP.Client        as HTTP
 
-main :: IO ()
-main = timed $ do
-    net <- newNetworkLayer
-    epochs  <- traverse (getEpoch net) [0..9]
-    print $ length epochs
+import           Cardano.Crypto.Wallet      (ChainCode (..), DerivationScheme (DerivationScheme2),
+                                             XPrv, XPub (..), deriveXPrv,
+                                             deriveXPub, generateNew, toXPub)
 
+
+main :: IO ()
+main = do
+    network <- newNetworkLayer
+
+    epochs <- timed "Get Epochs 0 -> tip" $ traverse (getEpoch network) [0..102]
+
+    let addrs = map (deriveAddress ExternalChain) [0..10] <> map (deriveAddress InternalChain) [0..10]
+    let isOurs (Tx _ outs) =
+            not $ null $ intersect addrs (address <$> Map.elems outs)
+
+    timed "concat txs" $ do
+        let txs = filter isOurs (concatMap (Set.toList . transactions) $ mconcat epochs)
+        BL8.putStrLn $ Aeson.encodePretty txs
+
+
+
+deriveAddress chain ix =
+    let
+        rootXPrv = generateNew
+            ("v\190\235Y\179#\181s]M\214\142g\178\245\DC4\226\220\f\167" :: ByteString)
+            (mempty :: ByteString)
+            (mempty :: ByteString)
+        accXPrv =
+            deriveAccountPrivateKey mempty rootXPrv 0x80000000
+        addrXPrv =
+            deriveAddressPrivateKey mempty accXPrv chain ix
+    in
+        xpubToAddress $ toXPub addrXPrv
 
 {-------------------------------------------------------------------------------
                             PRIMITIVE TYPES
 --------------------------------------------------------------------------------}
 
+class Dom a where
+  type DomElem a :: *
+  dom :: a -> Set (DomElem a)
+
+
 data Block = Block
     { header       :: !BlockHeader
-    , transactions :: [Tx]
+    , transactions :: !(Set Tx)
     } deriving (Show, Generic)
 
 instance NFData Block
@@ -81,9 +124,9 @@ instance ToJSON BlockHeaderHash where
 
 
 data Tx = Tx
-    { inputs  :: [TxInput]
-    , outputs :: [TxOutput]
-    } deriving (Show, Generic)
+    { inputs  :: !(Set TxIn)
+    , outputs :: !(Map Word32 TxOut)
+    } deriving (Show, Ord, Eq, Generic)
 
 instance NFData Tx
 
@@ -93,7 +136,7 @@ instance ToJSON Tx where
 
 newtype Address = Address
     { getAddress :: ByteString
-    } deriving (Show, Generic)
+    } deriving (Show, Ord, Eq, Generic)
 
 instance NFData Address
 
@@ -103,45 +146,300 @@ instance ToJSON Address where
 
 newtype TxId = TxId
     { getTxId :: ByteString
-    } deriving (Show, Generic)
+    } deriving (Show, Ord, Eq, Generic)
 
 instance NFData TxId
 
 instance ToJSON TxId where
     toJSON = Aeson.String . T.decodeUtf8 . B16.encode . getTxId
 
-data TxInput = TxInput
+data TxIn = TxIn
     { txId    :: !TxId
     , txIndex :: !Word32
-    } deriving (Show, Generic)
+    } deriving (Show, Ord, Eq, Generic)
 
-instance NFData TxInput
+instance NFData TxIn
 
-instance ToJSON TxInput where
+instance ToJSON TxIn where
     toJSON = Aeson.genericToJSON Aeson.defaultOptions
 
 
-data TxOutput = TxOutput
+data TxOut = TxOut
     { address :: !Address
-    , coin    :: !Word64
-    } deriving (Show, Generic)
+    , coin    :: !Coin
+    } deriving (Show, Ord, Eq, Generic)
 
-instance NFData TxOutput
+instance NFData TxOut
 
-instance ToJSON TxOutput where
+instance ToJSON TxOut where
     toJSON = Aeson.genericToJSON Aeson.defaultOptions
 
+
+newtype Coin = Coin
+    { getCoin :: Word64
+    } deriving (Show, Ord, Eq, Generic)
+
+instance NFData Coin
+
+instance ToJSON Coin where
+    toJSON = toJSON . getCoin
+
+instance Semigroup Coin where
+  (Coin a) <> (Coin b) = Coin (a + b)
+
+instance Monoid Coin where
+  mempty  = Coin 0
+  mconcat = foldr (<>) mempty
 
 data TxWitness = TxWitness deriving (Show)
 
+
+newtype UTxO = UTxO (Map TxIn TxOut)
+  deriving (Eq, Ord)
+
+instance Semigroup UTxO where
+  (UTxO a) <> (UTxO b) = UTxO (a <> b)
+
+instance Monoid UTxO where
+  mempty  = UTxO mempty
+  mconcat = foldr (<>) mempty
+
+instance Dom UTxO where
+  type DomElem UTxO = TxIn
+  dom (UTxO utxo)   = Set.fromList $ Map.keys utxo
+
+
+{-------------------------------------------------------------------------------
+                           WALLET BUSINESS LOGIC
+--------------------------------------------------------------------------------}
+
+-- Assumed to be 'effectively' injective (2.1 UTxO-style Accounting)
+txid :: Tx -> TxId
+txid =
+  error "How to compute a 'unique' identifier from a Transaction (e.g. hashing)?"
+
+-- This only satistfies for single-account model
+addressIsOurs :: Address -> Bool
+addressIsOurs =
+  error "How to tell whether an address is ours?"
+
+
+-- * Tx Manipulation
+
+txins :: Set Tx -> Set TxIn
+txins =
+    Set.unions . Set.map inputs
+
+txutxo :: Set Tx -> UTxO
+txutxo =
+    Set.foldr' (<>) (UTxO mempty) . Set.map utxo
+ where
+    utxo :: Tx -> UTxO
+    utxo tx@(Tx _ outs) =
+        UTxO $ Map.mapKeys (TxIn (txid tx)) outs
+
+txoutsOurs :: Set Tx -> Set TxOut
+txoutsOurs =
+    Set.unions . Set.map txoutOurs
+ where
+    txoutOurs :: Tx -> Set TxOut
+    txoutOurs (Tx _ outs) =
+        Set.filter (addressIsOurs . address) $ Set.fromList $ Map.elems outs
+
+
+-- * UTxO Manipulation
+
+-- ins⊲ u
+restrictedBy :: UTxO -> Set TxIn -> UTxO
+restrictedBy (UTxO utxo) =
+    UTxO . Map.restrictKeys utxo
+
+-- ins⋪ u
+excluding :: UTxO -> Set TxIn ->  UTxO
+excluding (UTxO utxo) =
+    UTxO . Map.withoutKeys utxo
+
+-- u ⊳ outs
+restrictedTo :: UTxO -> Set TxOut ->  UTxO
+restrictedTo (UTxO utxo) outs =
+    UTxO $ Map.filter (`Set.member` outs) utxo
+
+-- a ⊆ b
+isSubsetOf :: UTxO -> UTxO -> Bool
+isSubsetOf (UTxO a) (UTxO b) =
+    a `Map.isSubmapOf` b
+
+balance :: UTxO -> Coin
+balance (UTxO utxo) =
+    mconcat $ map coin $ Map.elems utxo
+
+changeUTxO :: Set Tx -> UTxO
+changeUTxO pending =
+    let
+        ours = txoutsOurs pending
+        ins  = txins pending
+    in
+        (txutxo pending `restrictedTo` ours) `restrictedBy` ins
+
+updateUTxO :: Block -> UTxO -> UTxO
+updateUTxO b utxo =
+    let
+        txs   = transactions b
+        utxo' = txutxo txs `restrictedTo` txoutsOurs txs
+        ins   = txins txs
+    in
+        (utxo <> utxo') `excluding` ins
+
+updatePending :: Block -> Set Tx -> Set Tx
+updatePending b =
+    let
+        isStillPending ins = Set.null . Set.intersection ins . inputs
+    in
+        Set.filter (isStillPending (txins $ transactions b))
+
+
+-- * Wallet
+
+data Wallet = Wallet
+    { walletUTxO    :: UTxO
+    , walletPending :: Set Tx
+    }
+
+type Checkpoints = NonEmpty Wallet
+
+instance Semigroup Wallet where
+    (Wallet u1 p1) <> (Wallet u2 p2) =
+        Wallet (u1 <> u2) (p1 <> p2)
+
+instance Monoid Wallet where
+  mempty  = Wallet mempty mempty
+  mconcat = foldr (<>) mempty
+
+availableBalance :: Wallet -> Coin
+availableBalance =
+    balance . availableUTxO
+
+availableUTxO :: Wallet -> UTxO
+availableUTxO (Wallet utxo pending) =
+    utxo `excluding` txins pending
+
+totalUTxO :: Wallet -> UTxO
+totalUTxO wallet@(Wallet _ pending) =
+    availableUTxO wallet <> changeUTxO pending
+
+totalBalance :: Wallet -> Coin
+totalBalance =
+    balance . totalUTxO
+
+applyBlock :: Block -> Checkpoints -> Checkpoints
+applyBlock b (Wallet utxo pending :| checkpoints) =
+    invariant applyBlockSafe "applyBlock requires: dom (utxo b) ∩ dom utxo = ∅" $
+        Set.null $ dom (txutxo $ transactions b) `Set.intersection` dom utxo
+  where
+    applyBlockSafe =
+        Wallet (updateUTxO b utxo) (updatePending b pending) :| checkpoints
+
+newPending :: Tx -> Checkpoints -> Checkpoints
+newPending tx (wallet@(Wallet utxo pending) :| checkpoints) =
+    invariant newPendingSafe "newPending requires: ins ⊆ dom (available (utxo, pending))" $
+        Set.null $ inputs tx \\ dom (availableUTxO wallet)
+  where
+    newPendingSafe =
+        Wallet utxo (pending <> Set.singleton tx) :| checkpoints
+
+rollback :: Checkpoints -> Checkpoints
+rollback = \case
+    Wallet _ pending :| Wallet utxo' pending' : checkpoints ->
+        Wallet utxo' (pending <> pending') :| checkpoints
+    checkpoints ->
+        checkpoints
+
+
+{-------------------------------------------------------------------------------
+                             ADDRESS DERIVATION
+--------------------------------------------------------------------------------}
+
+purposeIndex :: Word32
+purposeIndex = 0x8000002C
+
+coinTypeIndex :: Word32
+coinTypeIndex = 0x80000717
+
+data ChangeChain
+    = InternalChain
+    | ExternalChain
+    deriving (Show, Eq)
+
+isInternalChange :: ChangeChain -> Bool
+isInternalChange InternalChain = True
+isInternalChange _             = False
+
+changeToIndex :: ChangeChain -> Word32
+changeToIndex ExternalChain = 0
+changeToIndex InternalChain = 1
+
+deriveAddressPrivateKey
+    :: ByteString    -- Passphrase used to encrypt Account Private Key
+    -> XPrv          -- Account Private Key
+    -> ChangeChain   -- Change chain
+    -> Word32        -- Non-hardened Address Key Index
+    -> XPrv          -- Address Private Key
+deriveAddressPrivateKey passPhrase accXPrv changeChain addressIx =
+    let -- lvl4 derivation in bip44 is derivation of change chain
+        changeXPrv  = deriveXPrv DerivationScheme2 passPhrase accXPrv (changeToIndex changeChain)
+    in  -- lvl5 derivation in bip44 is derivation of address chain
+        deriveXPrv DerivationScheme2 passPhrase changeXPrv addressIx
+
+deriveAccountPrivateKey
+    :: ByteString   -- Passphrase used to encrypt Master Private Key
+    -> XPrv         -- Master Private Key
+    -> Word32       -- Hardened Account Key Index
+    -> XPrv         -- Account Private Key
+deriveAccountPrivateKey passPhrase masterXPrv accountIx =
+    let -- lvl1 derivation in bip44 is hardened derivation of purpose' chain
+        purposeXPrv = deriveXPrv DerivationScheme2 passPhrase masterXPrv purposeIndex
+        -- lvl2 derivation in bip44 is hardened derivation of coin_type' chain
+        coinTypeXPrv = deriveXPrv DerivationScheme2 passPhrase purposeXPrv coinTypeIndex
+    in  -- lvl3 derivation in bip44 is hardened derivation of account' chain
+        deriveXPrv DerivationScheme2 passPhrase coinTypeXPrv accountIx
+
+xpubToAddress
+    :: XPub
+    -> Address
+xpubToAddress xpub =
+    let
+        tag = 24 -- NOTE: Hard-coded tag value in cardano-sl
+        root = convert $ hash @_ @Blake2b_224 $ hash @_ @SHA3_256 $ CBOR.toStrictByteString $ mempty
+            <> CBOR.encodeListLen 3
+            <> CBOR.encodeWord8 0 -- Address Type
+            <> CBOR.encodeListLen 2 <> CBOR.encodeWord8 0 <> encodeXPub xpub -- Address Spending Data
+            <> CBOR.encodeMapLen 0 -- Address Attributes, none
+        payload = CBOR.toStrictByteString $ mempty
+            <> CBOR.encodeListLen 3
+            <> CBOR.encodeBytes root
+            <> CBOR.encodeMapLen 0 -- Address Attributes, none
+            <> CBOR.encodeWord8 0 -- Address Type
+    in
+        Address $ CBOR.toStrictByteString $ mempty
+            <> CBOR.encodeListLen 2
+            <> CBOR.encodeTag tag
+            <> CBOR.encodeBytes payload
+            <> CBOR.encodeWord32 (crc32 payload)
+
+encodeXPub
+    :: XPub
+    -> CBOR.Encoding
+encodeXPub (XPub pub (ChainCode cc)) = mempty
+    <> CBOR.encodeBytes (pub <> cc)
 
 {-------------------------------------------------------------------------------
                               NETWORK LAYER
 --------------------------------------------------------------------------------}
 
 data NetworkLayer = NetworkLayer
-    { getBlock :: BlockHeaderHash -> IO Block
-    , getEpoch :: Int -> IO [Block]
+    { getBlock      :: BlockHeaderHash -> IO Block
+    , getEpoch      :: Int -> IO [Block]
+    , getNetworkTip :: IO BlockHeader
     }
 
 
@@ -149,6 +447,7 @@ mkNetworkLayer :: Manager -> NetworkLayer
 mkNetworkLayer manager = NetworkLayer
     { getBlock = _getBlock manager
     , getEpoch = _getEpoch manager
+    , getNetworkTip = _getNetworkTip manager
     }
 
 
@@ -165,8 +464,8 @@ _getBlock manager (BlockHeaderHash hash) = do
             , path = "/mainnet/block/" <> hash
             }
     res <- httpLbs req manager
-    let (Right (_, block)) = CBOR.deserialiseFromBytes decodeBlock $ responseBody res
-    return $ block `deepseq` block
+    let block = unsafeDeserialiseFromBytes decodeBlock $ responseBody res
+    return block
 
 
 _getEpoch :: Manager -> Int -> IO [Block]
@@ -177,7 +476,18 @@ _getEpoch manager n = do
             }
     res <- httpLbs req manager
     let epoch = deserialiseEpoch decodeBlock (responseBody res)
-    return $ epoch `deepseq` epoch
+    return epoch
+
+
+_getNetworkTip :: Manager -> IO BlockHeader
+_getNetworkTip manager = do
+    let req = defaultRequest
+            { port = 1337
+            , path = "/mainnet/tip"
+            }
+    res <- httpLbs req manager
+    let tip = unsafeDeserialiseFromBytes decodeBlockHeader $ responseBody res
+    return tip
 
 
 {-------------------------------------------------------------------------------
@@ -196,6 +506,11 @@ _getEpoch manager n = do
     Block are encoded using CBOR, with a format described in 'CBOR DECODERS'
 
 --------------------------------------------------------------------------------}
+
+unsafeDeserialiseFromBytes :: (forall s. CBOR.Decoder s a) -> BL.ByteString -> a
+unsafeDeserialiseFromBytes decoder bytes =
+    either (\e -> error $ "unsafeDeserialiseFromBytes: " <> show e) snd $
+        CBOR.deserialiseFromBytes decoder bytes
 
 deserialiseEpoch :: CBOR.Decoder s Block -> BL.ByteString -> [Block]
 deserialiseEpoch decoder = deserialiseEpoch' [] . checkHeader
@@ -221,7 +536,9 @@ deserialiseEpoch decoder = deserialiseEpoch' [] . checkHeader
         | BL.null bytes =
             -- NOTE
             -- We remove the genesis block has it contains very little information
-            -- for the wallet backend.
+            -- for the wallet backend. We do also reverse the list to get block
+            -- in order since we've been prepending blocks to construct the
+            -- epoch and avoid making the algorithm complexity explodes. Cf below.
             drop 1 (reverse epoch)
         | otherwise =
             let
@@ -231,9 +548,14 @@ deserialiseEpoch decoder = deserialiseEpoch' [] . checkHeader
                 (blkBytes, r1) =
                     BL.splitAt size r0
 
-                (Right (_, block)) =
-                    CBOR.deserialiseFromBytes decodeBlock blkBytes
+                block =
+                    unsafeDeserialiseFromBytes decodeBlock blkBytes
             in
+                -- NOTE
+                -- Careful here when appending blocks to the accumulator 'epoch'
+                -- doing a naive `epoch ++ [block]` has a dramatic impact on the
+                -- complexity. So we better append elements and reverse the list
+                -- at the end!
                 deserialiseEpoch' (block : epoch) (BL.drop (pad size) r1)
 
     pad :: Int64 -> Int64
@@ -271,7 +593,7 @@ decodeAddress = do
     _ <- CBOR.decodeListLenCanonicalOf 2 -- CRC Protection Wrapper
     tag <- CBOR.decodeTag -- Myterious hard-coded tag cardano-sl seems to so much like
     bytes <- CBOR.decodeBytes -- Addr Root + Attributes + Type
-    crc <- CBOR.decodeWord -- CRC
+    crc <- CBOR.decodeWord32 -- CRC
     -- NOTE 1:
     -- Treating addresses as a blob here, so we just reencod them as such
     -- Ultimately for us, addresses are nothing more than a bunch of bytes that
@@ -283,7 +605,7 @@ decodeAddress = do
         <> CBOR.encodeListLen 2
         <> CBOR.encodeTag tag
         <> CBOR.encodeBytes bytes
-        <> CBOR.encodeWord crc
+        <> CBOR.encodeWord32 crc
 
 decodeAttributes :: CBOR.Decoder s ()
 decodeAttributes = do
@@ -298,8 +620,14 @@ decodeBlock = do
         0 -> do -- Genesis Block
             _ <- CBOR.decodeListLenCanonicalOf 3
             header <- decodeGenesisBlockHeader
-            -- _ <- decodeGenesisBlockBody
-            return $ Block header []
+            -- NOTE
+            -- We don't decode the body of genesis block because we don't
+            -- need it (see @decodeGenesisBlockBody@). Genesis blocks occurs at
+            -- every epoch boundaries and contains various information about
+            -- protocol updates, slot leaders elections and delegation.
+            -- Yet, they don't contain any transaction and we can get away with
+            -- a 'mempty' here.
+            return $ Block header mempty
 
         1 -> do -- Main Block
             _ <- CBOR.decodeListLenCanonicalOf 3
@@ -358,6 +686,12 @@ decodeGenesisBlockHeader = do
     _ <- decodeGenesisProof
     epochIndex <- decodeGenesisConsensusData
     _ <- decodeGenesisExtraData
+    -- NOTE
+    -- Careful here, we do return a slot number of 0, which means that if we
+    -- naively parse all blocks from an epoch, two of them will have a slot
+    -- number of `0`. In practices, when parsing a full epoch, we can discard
+    -- the genesis block entirely and we won't bother about modelling this
+    -- extra complexity at the type-level. That's a bit dodgy though.
     return $ BlockHeader epochIndex 0 previous
 
 decodeGenesisConsensusData :: CBOR.Decoder s Word64
@@ -395,7 +729,7 @@ decodeLightIndex = do
     _ <- CBOR.decodeWord64 -- Epoch Index #2
     return ()
 
-decodeMainBlockBody :: CBOR.Decoder s [Tx]
+decodeMainBlockBody :: CBOR.Decoder s (Set Tx)
 decodeMainBlockBody = do
     _ <- CBOR.decodeListLenCanonicalOf 4
     decodeTxPayload
@@ -524,43 +858,43 @@ decodeTx :: CBOR.Decoder s (Tx, TxWitness)
 decodeTx = do
     _ <- CBOR.decodeListLenCanonicalOf 2
     _ <- CBOR.decodeListLenCanonicalOf 3
-    inputs <- decodeListIndef decodeTxInput
-    outputs <- decodeListIndef decodeTxOutput
+    inputs <- decodeListIndef decodeTxIn
+    outputs <- decodeListIndef decodeTxOut
     _ <- decodeAttributes
     _ <- decodeList decodeTxWitness
-    return (Tx inputs outputs, TxWitness)
+    return (Tx (Set.fromList inputs) (Map.fromList (zip [0..] outputs)), TxWitness)
 
-decodeTxPayload :: CBOR.Decoder s [Tx]
+decodeTxPayload :: CBOR.Decoder s (Set Tx)
 decodeTxPayload = do
     (txs, _) <- unzip <$> decodeListIndef decodeTx
-    return txs
+    return $ Set.fromList txs
 
-decodeTxInput :: CBOR.Decoder s TxInput
-decodeTxInput = do
+decodeTxIn :: CBOR.Decoder s TxIn
+decodeTxIn = do
     _ <- CBOR.decodeListLenCanonicalOf 2
     t <- CBOR.decodeWord8
     case t of
         0 -> do
             _ <- CBOR.decodeTag
             bytes <- CBOR.decodeBytes
-            case CBOR.deserialiseFromBytes decodeTxInput' (BL.fromStrict bytes) of
+            case CBOR.deserialiseFromBytes decodeTxIn' (BL.fromStrict bytes) of
                 Right (_, input) -> return input
                 Left err         -> fail $ show err
-        _ -> fail $ "decodeTxInput: unknown tx input constructor: " <> show t
+        _ -> fail $ "decodeTxIn: unknown tx input constructor: " <> show t
   where
-    decodeTxInput' :: CBOR.Decoder s TxInput
-    decodeTxInput' = do
+    decodeTxIn' :: CBOR.Decoder s TxIn
+    decodeTxIn' = do
         _ <- CBOR.decodeListLenCanonicalOf 2
         txId <- CBOR.decodeBytes
         index <- CBOR.decodeWord32
-        return $ TxInput (TxId txId) index
+        return $ TxIn (TxId txId) index
 
-decodeTxOutput :: CBOR.Decoder s TxOutput
-decodeTxOutput = do
+decodeTxOut :: CBOR.Decoder s TxOut
+decodeTxOut = do
     _ <- CBOR.decodeListLenCanonicalOf 2
     addr <- decodeAddress
     coin <- CBOR.decodeWord64
-    return $ TxOutput addr coin
+    return $ TxOut addr (Coin coin)
 
 decodeTxProof :: CBOR.Decoder s ()
 decodeTxProof = do
@@ -620,7 +954,7 @@ inspectNextToken =
 decodeList :: forall s a . CBOR.Decoder s a -> CBOR.Decoder s [a]
 decodeList decodeOne = do
     l <- CBOR.decodeListLenCanonical
-    CBOR.decodeSequenceLenN (\xs x -> xs ++ [x]) [] id l decodeOne
+    CBOR.decodeSequenceLenN (flip (:)) [] reverse l decodeOne
 
 -- | Decode an arbitrary long list. CBOR introduce a "break" character to
 -- mark the end of the list, so we simply decode each item until we encounter
@@ -636,7 +970,7 @@ decodeList decodeOne = do
 decodeListIndef :: forall s a. CBOR.Decoder s a -> CBOR.Decoder s [a]
 decodeListIndef decodeOne = do
     _ <- CBOR.decodeListLenIndef
-    CBOR.decodeSequenceLenIndef (\xs x -> xs ++ [x]) [] id decodeOne
+    CBOR.decodeSequenceLenIndef (flip (:)) [] reverse decodeOne
 
 
 {-------------------------------------------------------------------------------
@@ -645,8 +979,13 @@ decodeListIndef decodeOne = do
   Project various utils unrelated to any particular business logic.
 --------------------------------------------------------------------------------}
 
-timed :: IO () -> IO ()
-timed io = do
+timed :: String -> IO a -> IO a
+timed label io = do
     start <- getCurrentTime
-    io
-    getCurrentTime >>= \end -> print (diffUTCTime end start)
+    a <- io
+    getCurrentTime >>= \end -> putStrLn (label <> ": " <> show (diffUTCTime end start))
+    return a
+
+invariant :: a -> String -> Bool -> a
+invariant next msg predicate =
+  if predicate then next else error msg
