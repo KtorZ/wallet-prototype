@@ -438,11 +438,9 @@ _newPending tx (wallet@(Wallet utxo pending s) :| checkpoints) =
         Wallet utxo (pending <> Set.singleton tx) s :| checkpoints
 
 _rollback :: Checkpoints scheme -> Checkpoints scheme
-_rollback = \case
-    Wallet _ pending _ :| Wallet utxo' pending' s' : checkpoints ->
-        Wallet utxo' (pending <> pending') s' :| checkpoints
-    checkpoints ->
-        checkpoints
+_rollback (Wallet _ pending _ :| Wallet utxo' pending' s' : checkpoints)
+   = Wallet utxo' (pending <> pending') s' :| checkpoints
+_rollback checkpoints = checkpoints
 
 
 {-------------------------------------------------------------------------------
