@@ -11,6 +11,7 @@
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE TupleSections              #-}
 {-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeFamilies               #-}
 
@@ -49,10 +50,14 @@ import qualified Codec.CBOR.Decoding              as CBOR
 import qualified Codec.CBOR.Encoding              as CBOR
 import qualified Codec.CBOR.Read                  as CBOR
 import qualified Codec.CBOR.Write                 as CBOR
+import           Control.Applicative              ((<|>))
 import           Control.Arrow                    (first)
-import           Control.DeepSeq                  (NFData, deepseq)
+import           Control.Concurrent.MVar          (modifyMVar_, newMVar,
+                                                   putMVar, readMVar, takeMVar)
+import           Control.DeepSeq                  (NFData (..), deepseq)
 import           Control.Monad                    (forM_, void, when)
-import           Control.Monad.Trans.State.Strict (State, runState, state)
+import           Control.Monad.Trans.State.Strict (State, evalState, runState,
+                                                   state)
 import qualified Crypto.Cipher.ChaChaPoly1305     as Poly
 import           Crypto.Error                     (CryptoError (..),
                                                    CryptoFailable (..))
@@ -60,7 +65,7 @@ import           Crypto.Hash                      (hash)
 import           Crypto.Hash.Algorithms           (Blake2b_224, Blake2b_256,
                                                    SHA3_256, SHA512 (..))
 import qualified Crypto.KDF.PBKDF2                as PBKDF2
-import           Data.Aeson                       (ToJSON (..))
+import           Data.Aeson                       (ToJSON (..), ToJSONKey (..))
 import qualified Data.Aeson                       as Aeson
 import qualified Data.Aeson.Encode.Pretty         as Aeson
 import           Data.Bits                        (shiftL, (.|.))
@@ -74,13 +79,16 @@ import qualified Data.ByteString.Char8            as B8
 import qualified Data.ByteString.Lazy             as BL
 import qualified Data.ByteString.Lazy.Char8       as BL8
 import           Data.Digest.CRC32                (crc32)
+import           Data.Foldable                    (foldl')
 import           Data.Generics.Labels             ()
 import           Data.Int                         (Int64)
-import           Data.List                        (intersect, partition)
+import           Data.List                        (intersect, nub, partition)
 import           Data.List.NonEmpty               (NonEmpty (..))
+import qualified Data.List.NonEmpty               as NE
 import           Data.Map.Strict                  (Map)
 import qualified Data.Map.Strict                  as Map
-import           Data.Maybe                       (catMaybes, fromJust, isJust)
+import           Data.Maybe                       (catMaybes, fromJust, isJust,
+                                                   mapMaybe)
 import           Data.Proxy                       (Proxy (..))
 import           Data.Set                         (Set, (\\))
 import qualified Data.Set                         as Set
@@ -109,8 +117,21 @@ main = do
     runTests
     network <- newNetworkLayer
     epochs <- syncWithMainnet network
---    restoreDaedalusWallet epochs >>= prettyPrint
-    restoreYoroiWallet epochs >>= prettyPrint
+
+    timed "Restored Yoroi Wallet" $ do
+        putStrLn "Restoring Yoroi Wallet..."
+        wallet <- newWalletLayerSeq yoroiXPrv
+        forM_ epochs (applyBlocks wallet)
+        totalBalance wallet >>= prettyPrint . (Aeson.String "Total Balance",)
+        totalUTxO wallet >>= prettyPrint . (Aeson.String "Total UTxO",)
+        knownAddresses wallet >>= prettyPrint . (Aeson.String "Addresses",)
+
+    timed "Restored Daedalus Wallet" $ do
+        putStrLn "Restoring Daedalus Wallet..."
+        wallet <- newWalletLayerRnd daedalusXPrv
+        forM_ epochs (applyBlocks wallet)
+        totalBalance wallet >>= prettyPrint . (Aeson.String "Total Balance",)
+        totalUTxO wallet >>= prettyPrint . (Aeson.String "Total UTxO",)
 
 
 {-------------------------------------------------------------------------------
@@ -156,7 +177,11 @@ instance ToJSON BlockHeaderHash where
 
 
 data Tx = Tx
-    { inputs  :: !(Set TxIn)
+    { inputs  :: ![TxIn]
+        -- ^ NOTE: Careful about the 'TxIn'. It could be tempting to make it a
+        -- 'Set', but we need the ordering at this level! Even if the wallet
+        -- doesn't care so-to-speak, we still need the ordering in order to
+        -- compute tx id correctly (Cf how the tx id is computed, see @txid@)
     , outputs :: !(Map Word32 TxOut)
     } deriving (Show, Ord, Eq, Generic)
 
@@ -176,6 +201,17 @@ instance ToJSON Address where
     toJSON = Aeson.String . T.decodeUtf8 . encodeBase58 bitcoinAlphabet . getAddress
 
 
+data AddressState
+    = Used
+    | Fresh
+    deriving (Show, Generic)
+
+instance NFData AddressState
+
+instance ToJSON AddressState where
+    toJSON = Aeson.genericToJSON Aeson.defaultOptions
+
+
 newtype TxId = TxId
     { getTxId :: ByteString
     } deriving (Show, Ord, Eq, Generic)
@@ -192,9 +228,9 @@ data TxIn = TxIn
 
 instance NFData TxIn
 
+instance ToJSONKey TxIn
 instance ToJSON TxIn where
     toJSON = Aeson.genericToJSON Aeson.defaultOptions
-
 
 data TxOut = TxOut
     { address :: !Address
@@ -208,13 +244,9 @@ instance ToJSON TxOut where
 
 
 newtype Coin = Coin
-    { getCoin :: Word64
-    } deriving (Show, Ord, Eq, Generic)
-
-instance NFData Coin
-
-instance ToJSON Coin where
-    toJSON = toJSON . getCoin
+    { getCoin :: Word64 }
+    deriving stock (Show, Ord, Eq, Generic)
+    deriving newtype (NFData, ToJSON)
 
 instance Semigroup Coin where
   (Coin a) <> (Coin b) = Coin (a + b)
@@ -226,15 +258,9 @@ instance Monoid Coin where
 data TxWitness = TxWitness deriving (Show)
 
 
-newtype UTxO = UTxO (Map TxIn TxOut)
-  deriving (Eq, Ord)
-
-instance Semigroup UTxO where
-  (UTxO a) <> (UTxO b) = UTxO (a <> b)
-
-instance Monoid UTxO where
-  mempty  = UTxO mempty
-  mconcat = foldr (<>) mempty
+newtype UTxO = UTxO { getUTxO :: Map TxIn TxOut }
+  deriving stock (Show, Eq, Ord)
+  deriving newtype (Semigroup, Monoid, NFData, ToJSON)
 
 instance Dom UTxO where
   type DomElem UTxO = TxIn
@@ -256,7 +282,7 @@ txId =
 
 txins :: Set Tx -> Set TxIn
 txins =
-    Set.unions . Set.map inputs
+    Set.unions . Set.map (Set.fromList . inputs)
 
 txutxo :: Set Tx -> UTxO
 txutxo =
@@ -279,7 +305,7 @@ txoutsOurs isOurs txs =
         outs' <- flip Map.traverseMaybeWithKey outs $ \_ out -> do
             predicate <- state $ isOurs (address out)
             return $ if predicate then Just out else Nothing
-        return $ Map.elems outs
+        return $ Map.elems outs'
 
 
 -- * UTxO Manipulation
@@ -318,56 +344,43 @@ changeUTxO isOurs pending = runState $ do
     let ins  = txins pending
     return $ (txutxo pending `restrictedTo` ours) `restrictedBy` ins
 
-updateUTxO
-    :: forall s. (Address -> s -> (Bool, s))
-    -> Block
-    -> UTxO
-    -> s
-    -> (UTxO, s)
-updateUTxO isOurs b utxo = runState $ do
-    let txs = transactions b
-    ours <- state $ txoutsOurs isOurs txs
-    let utxo' = txutxo txs `restrictedTo` ours
-    let ins = txins txs
-    return $ (utxo <> utxo') `excluding` ins
-
 updatePending :: Block -> Set Tx -> Set Tx
 updatePending b =
     let
-        isStillPending ins = Set.null . Set.intersection ins . inputs
+        isStillPending ins = Set.null . Set.intersection ins . Set.fromList . inputs
     in
         Set.filter (isStillPending (txins $ transactions b))
 
 
 -- * Wallet
 
+type Checkpoints scheme = NonEmpty (Wallet scheme)
+
 data Wallet scheme where
     Wallet
-        :: (IsOurs scheme, Semigroup (SchemeState scheme))
+        :: (IsOurs scheme, Semigroup (SchemeState scheme), NFData (SchemeState scheme))
         => UTxO
         -> Set Tx
         -> SchemeState scheme
         -> Wallet scheme
 
-type Checkpoints scheme = NonEmpty (Wallet scheme)
+instance NFData (Wallet scheme) where
+    rnf (Wallet utxo pending s) =
+        rnf utxo `deepseq` (rnf pending `deepseq` rnf s)
 
-instance Semigroup (Wallet scheme) where
-    (Wallet u1 p1 s1) <> (Wallet u2 p2 s2) =
-        Wallet (u1 <> u2) (p1 <> p2) (s1 <> s2)
+_availableBalance :: Wallet scheme -> Coin
+_availableBalance =
+    balance . _availableUTxO
 
-availableBalance :: Wallet scheme -> Coin
-availableBalance =
-    balance . availableUTxO
-
-availableUTxO :: Wallet scheme -> UTxO
-availableUTxO (Wallet utxo pending _) =
+_availableUTxO :: Wallet scheme -> UTxO
+_availableUTxO (Wallet utxo pending _) =
     utxo `excluding` txins pending
 
-totalUTxO
+_totalUTxO
     :: forall scheme. ()
     => Wallet scheme
     -> UTxO
-totalUTxO wallet@(Wallet _ pending s) =
+_totalUTxO wallet@(Wallet _ pending s) =
     let
         isOurs = addressIsOurs (Proxy :: Proxy scheme)
         -- NOTE
@@ -376,44 +389,146 @@ totalUTxO wallet@(Wallet _ pending s) =
         -- only discover new addresses when applying blocks.
         discardState = fst
     in
-        availableUTxO wallet <> discardState (changeUTxO isOurs pending s)
+        _availableUTxO wallet <> discardState (changeUTxO isOurs pending s)
 
-totalBalance
+_totalBalance
     :: Wallet scheme
     -> Coin
-totalBalance =
-    balance . totalUTxO
+_totalBalance =
+    balance . _totalUTxO
 
-applyBlock
+_applyBlock
     :: forall scheme. ()
     => Block
     -> Checkpoints scheme
     -> Checkpoints scheme
-applyBlock b (Wallet utxo pending s :| checkpoints) =
+_applyBlock b (cp@(Wallet utxo pending s) :| checkpoints) =
     invariant applyBlockSafe "applyBlock requires: dom (utxo b) ∩ dom utxo = ∅" $
         Set.null $ dom (txutxo $ transactions b) `Set.intersection` dom utxo
   where
+    prefilterBlock =
+        let
+            txs = transactions b
+            (ourOuts, s') = txoutsOurs (addressIsOurs (Proxy :: Proxy scheme)) txs s
+            ourUtxo = txutxo txs `restrictedTo` ourOuts
+            ourIns = txins txs `Set.intersection` dom (utxo <> ourUtxo)
+        in
+            (ourUtxo, ourIns, s')
+
     applyBlockSafe =
         let
-            (utxo', s') = updateUTxO (addressIsOurs (Proxy :: Proxy scheme)) b utxo s
+            (ourUtxo, ourIns, s') = prefilterBlock
+            utxo' = (utxo <> ourUtxo) `excluding` ourIns
             pending' = updatePending b pending
         in
-            Wallet utxo' pending' s' :| checkpoints
+            -- If there was no output or input belonging to us, we could in
+            -- theory just discard the checkpoint entirely:
+            --
+            --    if ourUtxo == mempty && ourIns == mempty then
+            --
+            -- Nevertheless, we have to be careful with rollbacks after that.
+            Wallet utxo' pending' s' :| cp : take 2160 checkpoints
 
-newPending :: Tx -> Checkpoints scheme -> Checkpoints scheme
-newPending tx (wallet@(Wallet utxo pending s) :| checkpoints) =
+_newPending :: Tx -> Checkpoints scheme -> Checkpoints scheme
+_newPending tx (wallet@(Wallet utxo pending s) :| checkpoints) =
     invariant newPendingSafe "newPending requires: ins ⊆ dom (available (utxo, pending))" $
-        Set.null $ inputs tx \\ dom (availableUTxO wallet)
+        Set.null $ Set.fromList (inputs tx) \\ dom (_availableUTxO wallet)
   where
     newPendingSafe =
         Wallet utxo (pending <> Set.singleton tx) s :| checkpoints
 
-rollback :: Checkpoints scheme -> Checkpoints scheme
-rollback = \case
+_rollback :: Checkpoints scheme -> Checkpoints scheme
+_rollback = \case
     Wallet _ pending _ :| Wallet utxo' pending' s' : checkpoints ->
         Wallet utxo' (pending <> pending') s' :| checkpoints
     checkpoints ->
         checkpoints
+
+
+{-------------------------------------------------------------------------------
+                               WALLET LAYER
+--------------------------------------------------------------------------------}
+
+data WalletLayer m = WalletLayer
+    { totalBalance   :: m Coin
+    , totalUTxO      :: m UTxO
+    , knownAddresses :: m [(AddressState, Address)]
+    , applyBlocks    :: [Block] -> m ()
+    }
+
+-- NOTE
+-- Just a "dummy" implementation of the wallet for which we actually simulate
+-- a "DB layer" with an MVar.
+-- The Wallet business logic is actually 100% pure code it would feel very wrong
+-- to change that unless REALLY forced to.
+--
+-- So here, we are getting data from an MVar, but it could be any sort of
+-- storage behind, even a remote one, it doesn't matter much.
+newWalletLayerSeq :: Key 'Seq 'Root0 XPrv -> IO (WalletLayer IO)
+newWalletLayerSeq rootXPrv = do
+    let accXPub =
+            keyToXPub $ deriveAccountPrivateKeySeq mempty rootXPrv (Index 0x80000000)
+    let internalPool =
+            AddressPool accXPub 1 InternalChain (nextAddresses accXPub 1 InternalChain (Index 0))
+    let externalPool =
+            AddressPool accXPub 20 ExternalChain (nextAddresses accXPub 20 ExternalChain (Index 0))
+    mvar <- newMVar $ Wallet @'Seq mempty mempty (internalPool, externalPool) :| []
+
+    return $ WalletLayer
+        { totalBalance = do
+            (wallet :| _) <- readMVar mvar
+            return (_totalBalance wallet)
+
+        , totalUTxO = do
+            (wallet :| _) <- readMVar mvar
+            return (_totalUTxO wallet)
+
+        , applyBlocks = \blocks -> do
+            checkpoints <- takeMVar mvar
+            let checkpoints' = foldl' (flip _applyBlock) checkpoints blocks
+            putMVar mvar checkpoints'
+
+        , knownAddresses = do
+            -- NOTE
+            -- This is a bit ad-hoc, but good enough for testing here. In
+            -- practice, we can also recover the known addresses from the list
+            -- of known transactions, provided we build such list!
+            (Wallet _ _ (s1, s2) :| _) <- readMVar mvar
+            let internalAddresses = Map.keys (s1 ^. #addresses)
+            let externalAddresses = Map.keys (s2 ^. #addresses)
+            return $ mconcat
+                [ (Used,) <$> internalAddresses
+                , (Used,) <$> take (length externalAddresses - fromIntegral (s2 ^. #gap)) externalAddresses
+                , (Fresh,) <$> drop (length externalAddresses - fromIntegral (s2 ^. #gap)) externalAddresses
+                ]
+        }
+
+
+newWalletLayerRnd :: Key 'Rnd 'Root0 XPrv -> IO (WalletLayer IO)
+newWalletLayerRnd rootXPrv = do
+    mvar <- newMVar $ Wallet @'Rnd mempty mempty (hdPassphrase $ keyToXPub rootXPrv) :| []
+
+    return $ WalletLayer
+        { totalBalance = do
+            (wallet :| _) <- readMVar mvar
+            return (_totalBalance wallet)
+
+        , totalUTxO = do
+            (wallet :| _) <- readMVar mvar
+            return (_totalUTxO wallet)
+
+        , applyBlocks = \blocks -> do
+            checkpoints <- takeMVar mvar
+            let checkpoints' = foldl' (flip _applyBlock) checkpoints blocks
+            putMVar mvar checkpoints'
+
+        , knownAddresses =
+            -- NOTE
+            -- This is trickier than for the sequential wallet because, we do
+            -- not store the addresses as we discover them. We could however
+            -- without much change.
+            error "newWalletLayerRnd.knownAddresses: Not Implemented"
+        }
 
 
 {-------------------------------------------------------------------------------
@@ -423,7 +538,9 @@ rollback = \case
 -- We introduce some phantom types here to force disctinction between the
 -- various key types we have; just to remove some confusion in type signatures
 newtype Key (scheme :: Scheme) (level :: Depth) key = Key
-    { getKey :: key }
+    { getKey :: key
+    } deriving newtype (Generic, NFData)
+
 
 keyToXPub :: Key scheme level XPrv -> Key scheme level XPub
 keyToXPub (Key xprv) = Key (toXPub xprv)
@@ -431,7 +548,7 @@ keyToXPub (Key xprv) = Key (toXPub xprv)
 -- Also introducing a type helper to distinguish between indexes
 newtype Index (derivationType :: DerivationType) (level :: Depth) = Index
     { getIndex :: Word32
-    }
+    } deriving newtype (NFData)
 
 data Scheme
     = Seq
@@ -449,7 +566,9 @@ data DerivationType
 data ChangeChain
     = InternalChain
     | ExternalChain
-    deriving (Show, Eq)
+    deriving (Show, Eq, Generic)
+
+instance NFData ChangeChain
 
 -- Not deriving 'Enum' because this could have a dramatic impact if we were
 -- to assign the wrong index to the corresponding constructor.
@@ -627,6 +746,19 @@ data AddressPool = AddressPool
         :: Map Address (Index 'Soft 'Addr5)
     } deriving (Generic)
 
+instance NFData AddressPool
+
+
+-- NOTE
+-- Dubious here. We may want to throw some invariant to make sure that
+-- account pub key, gap and change chain are equal!
+-- There shouldn't be any case where we would try to concat two different
+-- address pool. Maybe enforcing that at the type level directly would also
+-- help removing the ambiguity.
+instance Semigroup AddressPool where
+    (AddressPool pubKey g change a1) <> (AddressPool _ _ _ a2) =
+        AddressPool pubKey g change (a1 <> a2)
+
 lookupAddressPool
     :: Address
     -> AddressPool
@@ -664,25 +796,33 @@ nextAddresses key g changeChain (Index fromIx) =
     invariant safeNextAddresses "nextAddresses: toIx should be greater than fromIx" (toIx >= fromIx)
   where
     safeNextAddresses = [fromIx .. toIx]
-        & map (\ix -> (newAddress (Index ix), Index ix))
+        & mapMaybe (\ix -> (, Index ix) <$> newAddress (Index ix))
         & Map.fromList
     toIx = fromIx + fromIntegral g - 1
-    newAddress ix =
-        let
-            addr = deriveAddressPublicKeySeq key changeChain ix
-        in
-            invariant
-                (seqToAddress $ fromJust addr)
-                "nextAddresses: can't generate more addresses, max index reached"
-                (isJust addr)
+    -- NOTE
+    -- The only way to get a 'Nothing' when deriving a new address is with an
+    -- index that is out of bound. We will likely never reach that case in
+    -- practice, but if we do, it just means that there are no more 'new
+    -- addresses' to discover.
+    newAddress = fmap seqToAddress . deriveAddressPublicKeySeq key changeChain
 
+    -- NOTE
+    -- We have to scan both the internal and external chain. Note that, the
+    -- account discovery algorithm is only specified for the external chain so
+    -- in theory, there's nothing forcing a wallet to generate change
+    -- addresses on the internal chain anywhere in the available range.
+    --
+    -- In practice, we may assume that user can't create change addresses and
+    -- that they are just created in sequence by the wallet. Hence an address
+    -- pool with a gap of 1 should be sufficient.
 instance IsOurs 'Seq where
-    type SchemeState 'Seq = AddressPool
-    addressIsOurs _ addr = runState $ do
-        maddr <- state $ lookupAddressPool addr
-        return $ case maddr of
-            Just (_, Index ix) -> traceShow ix True
-            Nothing            -> False
+    type SchemeState 'Seq = (AddressPool, AddressPool)
+    addressIsOurs _ addr (s1, s2) =
+        let
+            (res1, s1') = lookupAddressPool addr s1
+            (res2, s2') = lookupAddressPool addr s2
+        in
+            (isJust (res1 <|> res2), (s1', s2'))
 
 
 {-------------------------------------------------------------------------------
@@ -1167,7 +1307,7 @@ decodeTx = do
     _ <- decodeAttributes
     _ <- decodeList decodeTxWitness
     return
-        ( Tx (Set.fromList inputs) (Map.fromList (zip [0..] outputs))
+        ( Tx inputs (Map.fromList (zip [0..] outputs))
         , TxWitness
         )
 
@@ -1289,7 +1429,7 @@ encodeTx :: Tx -> CBOR.Encoding
 encodeTx tx = mempty
     <> CBOR.encodeListLen 3
     <> CBOR.encodeListLenIndef
-    <> mconcat (encodeTxIn <$> Set.toList (inputs tx))
+    <> mconcat (encodeTxIn <$> inputs tx)
     <> CBOR.encodeBreak
     <> CBOR.encodeListLenIndef
     <> mconcat (encodeTxOut <$> Map.elems (outputs tx))
@@ -1402,46 +1542,10 @@ prettyPrint =
 --------------------------------------------------------------------------------}
 
 syncWithMainnet :: NetworkLayer -> IO [[Block]]
-syncWithMainnet network = timed "Sync With Mainnet" $ do
+syncWithMainnet network = timed "Synced With Mainnet" $ do
     tip <- getNetworkTip network
+    putStrLn $ "Syncing With Mainnet. Tip: " <> show (epochIndex tip) <> "." <> show (slotNumber tip)
     traverse (getEpoch network) [95..(fromIntegral (epochIndex tip) - 1)]
-
-restoreDaedalusWallet :: [[Block]] -> IO [Address]
-restoreDaedalusWallet epochs = timed "Restore Daedalus Wallet" $ do
-    let addresses = epochs
-            & mconcat
-            & concatMap (Set.toList . transactions)
-            & concatMap (Map.elems . outputs)
-            & map address
-    let isOurs = fst . flip (addressIsOurs (Proxy @Rnd)) (hdPassphrase $ keyToXPub daedalusXPrv)
-    return $ filter isOurs addresses
-
-restoreYoroiWallet :: [[Block]] -> IO [Address]
-restoreYoroiWallet epochs = timed "Restore Yoroi Wallet" $ do
-    let addresses = epochs
-            & mconcat
-            & concatMap (Set.toList . transactions)
-            & concatMap (Map.elems . outputs)
-            & map address
-
-    let accKey = keyToXPub $ deriveAccountPrivateKeySeq mempty yoroiXPrv (Index 0x80000000)
-    -- NOTE
-    -- We have to scan both the internal and external chain. Note that, the
-    -- account discovery algorithm is only specified for the external chain so
-    -- in theory, there's nothing forcing a wallet to generate change
-    -- addresses on the internal chain anywhere in the available range.
-    --
-    -- In practice, we may assume that user can't create change addresses and
-    -- that they are just created in sequence by the wallet. Hence an address
-    -- pool with a gap of 1 should be sufficient.
-    let pool  = AddressPool accKey 20 ExternalChain (nextAddresses accKey 20 ExternalChain (Index 0))
-    let pool' = AddressPool accKey 1 InternalChain (nextAddresses accKey 1 InternalChain (Index 0))
-    let f addr = do
-            ours <- state $ addressIsOurs (Proxy @Seq) addr
-            return $ if ours then Just addr else Nothing
-    let (addrs, _) = flip runState pool $ catMaybes <$> traverse f addresses
-    let (addrs', _) = flip runState pool' $ catMaybes <$> traverse f addresses
-    return $ addrs <> addrs'
 
 runTests :: IO ()
 runTests = do
