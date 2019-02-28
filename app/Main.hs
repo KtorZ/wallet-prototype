@@ -402,7 +402,15 @@ rollback = \case
 
 -- We introduce some phantom types here to force disctinction between the
 -- various key types we have; just to remove some confusion in type signatures
-newtype Key (scheme :: Scheme) (level :: Depth) = Key { getKey :: XPrv }
+newtype Key (scheme :: Scheme) (level :: Depth) key = Key
+    { getKey :: key }
+
+keyToXPub :: Key scheme level XPrv -> Key scheme level XPub
+keyToXPub (Key xprv) = Key (toXPub xprv)
+
+-- Also introducing a type helper to distinguish between indexes
+newtype Index (derivationType :: DerivationType) (level :: Depth) = Index
+    { getIndex :: Word32 }
 
 data Scheme
     = Seq
@@ -412,6 +420,10 @@ data Depth
     = Root0
     | Acct3
     | Addr5
+
+data DerivationType
+    = Hardened
+    | Soft
 
 data ChangeChain
     = InternalChain
@@ -429,53 +441,38 @@ instance Enum ChangeChain where
         ExternalChain -> 0
         InternalChain -> 1
 
-class HierarchicalDerivation (scheme :: Scheme) where
-    deriveAccountPrivateKey
-        :: ByteString -- Passphrase used to encrypt Master Private Key
-        -> Key scheme 'Root0 -- Master Private Key
-        -> Word32 -- Hardened Account Key Index
-        -> Key scheme 'Acct3 -- Account Private Key
-
-    deriveAddressPrivateKey
-        :: ByteString -- Passphrase used to encrypt Account Private Key
-        -> Key scheme 'Acct3 -- Account Private Key
-        -> ChangeChain -- Change chain
-        -> Word32 -- Non-hardened Address Key Index
-        -> Key scheme 'Addr5 -- Address Private Key
-
-class ToAddress (scheme :: Scheme) where
-    type ToAddressArgs scheme :: *
-    toAddress
-        :: Key scheme 'Addr5
-        -> ToAddressArgs scheme
-        -> Address
-
 
 -- * Random Derivation
 
-instance HierarchicalDerivation 'Rnd where
-    deriveAccountPrivateKey passPhrase (Key masterXPrv) accountIx =
-        Key $ deriveXPrv DerivationScheme1 passPhrase masterXPrv accountIx
+deriveAccountPrivateKeyRnd
+    :: ByteString -- Passphrase used to encrypt Master Private Key
+    -> Key 'Rnd 'Root0 XPrv
+    -> Index 'Hardened 'Acct3
+    -> Key 'Rnd 'Acct3 XPrv
+deriveAccountPrivateKeyRnd passPhrase (Key masterXPrv) (Index accIx) =
+    Key $ deriveXPrv DerivationScheme1 passPhrase masterXPrv accIx
 
-    deriveAddressPrivateKey passPhrase (Key accXPrv) _ addressIx =
-        Key $ deriveXPrv DerivationScheme1 passPhrase accXPrv addressIx
+deriveAddressPrivateKeyRnd
+    :: ByteString -- Passphrase used to encrypt Account Private Key
+    -> Key 'Rnd 'Acct3 XPrv
+    -> Index 'Soft 'Addr5
+    -> Key 'Rnd 'Addr5 XPrv
+deriveAddressPrivateKeyRnd passPhrase (Key accXPrv) (Index addrIx) =
+    Key $ deriveXPrv DerivationScheme1 passPhrase accXPrv addrIx
 
-
-data RandomAddressArgs = RandomAddressArgs
-    { rndAccountIx :: Word32
-    , rndAddressIx :: Word32
-    , rndRootXPrv  :: Key 'Rnd 'Root0
-    }
-
-instance ToAddress 'Rnd where
-    type ToAddressArgs 'Rnd = RandomAddressArgs
-    toAddress (Key xprv) (RandomAddressArgs rndAccountIx rndAddressIx rndRootXPrv) =
-        Address $ CBOR.toStrictByteString $ encodeAddress (toXPub xprv) encodeAttributes
-      where
-        encodeAttributes = mempty
-            <> CBOR.encodeMapLen 1
-            <> CBOR.encodeWord8 1
-            <> encodeDerivationPath (hdPassphrase rndRootXPrv) rndAccountIx rndAddressIx
+rndToAddress
+    :: Key 'Rnd 'Addr5 XPub
+    -> Key 'Rnd 'Root0 XPub
+    -> Index 'Hardened 'Acct3
+    -> Index 'Soft 'Addr5
+    -> Address
+rndToAddress (Key addrXPub) rootKey (Index accIx) (Index addrIx) =
+    Address $ CBOR.toStrictByteString $ encodeAddress addrXPub encodeAttributes
+  where
+    encodeAttributes = mempty
+        <> CBOR.encodeMapLen 1
+        <> CBOR.encodeWord8 1
+        <> encodeDerivationPath (hdPassphrase rootKey) accIx addrIx
 
 -- | Gotta love Serokell hard-coded nonce :) .. Kill me now.
 cardanoNonce :: ByteString
@@ -504,11 +501,11 @@ decryptDerPath passphrase bytes = do
     when (BA.convert (Poly.finalize st2) /= tag) $ CryptoFailed CryptoError_MacKeyInvalid
     return out
 
-hdPassphrase :: Key 'Rnd 'Root0 -> ByteString
-hdPassphrase (Key rootXPrv) = PBKDF2.generate
+hdPassphrase :: Key 'Rnd 'Root0 XPub -> ByteString
+hdPassphrase (Key rootXPub) = PBKDF2.generate
     (PBKDF2.prfHMAC SHA512)
     (PBKDF2.Parameters 500 32)
-    (unXPub $ toXPub rootXPrv)
+    (unXPub rootXPub)
     ("address-hashing" :: ByteString)
 
 
@@ -520,31 +517,54 @@ purposeIndex = 0x8000002C
 coinTypeIndex :: Word32
 coinTypeIndex = 0x80000717
 
-instance HierarchicalDerivation 'Seq where
-    deriveAccountPrivateKey passPhrase (Key masterXPrv) accountIx =
-        let -- lvl1 derivation in bip44 is hardened derivation of purpose' chain
-            purposeXPrv = deriveXPrv DerivationScheme2 passPhrase masterXPrv purposeIndex
-            -- lvl2 derivation in bip44 is hardened derivation of coin_type' chain
-            coinTypeXPrv = deriveXPrv DerivationScheme2 passPhrase purposeXPrv coinTypeIndex
-            -- lvl3 derivation in bip44 is hardened derivation of account' chain
-            acctXPrv = deriveXPrv DerivationScheme2 passPhrase coinTypeXPrv accountIx
-        in
-            Key acctXPrv
+deriveAccountPrivateKeySeq
+    :: ByteString -- Passphrase used to encrypt Master Private Key
+    -> Key 'Seq 'Root0 XPrv
+    -> Index 'Hardened 'Acct3
+    -> Key 'Seq 'Acct3 XPrv
+deriveAccountPrivateKeySeq passPhrase (Key masterXPrv) (Index accIx) =
+    let -- lvl1 derivation in bip44 is hardened derivation of purpose' chain
+        purposeXPrv = deriveXPrv DerivationScheme2 passPhrase masterXPrv purposeIndex
+        -- lvl2 derivation in bip44 is hardened derivation of coin_type' chain
+        coinTypeXPrv = deriveXPrv DerivationScheme2 passPhrase purposeXPrv coinTypeIndex
+        -- lvl3 derivation in bip44 is hardened derivation of account' chain
+        acctXPrv = deriveXPrv DerivationScheme2 passPhrase coinTypeXPrv accIx
+    in
+        Key acctXPrv
 
-    deriveAddressPrivateKey passPhrase (Key accXPrv) changeChain addressIx =
-        let -- lvl4 derivation in bip44 is derivation of change chain
-            changeXPrv = deriveXPrv DerivationScheme2 passPhrase accXPrv (fromIntegral $ fromEnum changeChain)
-            -- lvl5 derivation in bip44 is derivation of address chain
-            addrXPrv = deriveXPrv DerivationScheme2 passPhrase changeXPrv addressIx
-        in
-            Key addrXPrv
+deriveAddressPrivateKeySeq
+    :: ByteString -- Passphrase used to encrypt Account Private Key
+    -> Key 'Seq 'Acct3 XPrv
+    -> ChangeChain
+    -> Index 'Soft 'Addr5
+    -> Key 'Seq 'Addr5 XPrv
+deriveAddressPrivateKeySeq passPhrase (Key accXPrv) changeChain (Index addrIx) =
+    let -- lvl4 derivation in bip44 is derivation of change chain
+        changeXPrv = deriveXPrv DerivationScheme2 passPhrase accXPrv (fromIntegral $ fromEnum changeChain)
+        -- lvl5 derivation in bip44 is derivation of address chain
+        addrXPrv = deriveXPrv DerivationScheme2 passPhrase changeXPrv addrIx
+    in
+        Key addrXPrv
 
-instance ToAddress 'Seq where
-    type ToAddressArgs 'Seq = ()
-    toAddress (Key xprv) () =
-        Address $ CBOR.toStrictByteString $ encodeAddress (toXPub xprv) encodeAttributes
-      where
-        encodeAttributes = mempty <> CBOR.encodeMapLen 0
+deriveAddressPublicKeySeq
+    :: Key 'Seq 'Acct3 XPub
+    -> ChangeChain
+    -> Index 'Soft 'Addr5
+    -> Maybe (Key 'Seq 'Addr5 XPub)
+deriveAddressPublicKeySeq (Key accXPub) changeChain (Index addrIx) = do
+    -- lvl4 derivation in bip44 is derivation of change chain
+    changeXPub <- deriveXPub DerivationScheme2 accXPub (fromIntegral $ fromEnum changeChain)
+    -- lvl5 derivation in bip44 is derivation of address chain
+    addrXPub <- deriveXPub DerivationScheme2 changeXPub addrIx
+    return $ Key addrXPub
+
+seqToAddress
+    :: Key 'Seq 'Addr5 XPub
+    -> Address
+seqToAddress (Key xpub) =
+    Address $ CBOR.toStrictByteString $ encodeAddress xpub encodeAttributes
+  where
+    encodeAttributes = mempty <> CBOR.encodeMapLen 0
 
 
 {-------------------------------------------------------------------------------
@@ -1305,7 +1325,7 @@ syncWithMainnet network = timed "Sync With Mainnet" $ do
 restoreDaedalusWallet :: [[Block]] -> IO [Address]
 restoreDaedalusWallet epochs = timed "Restore Daedalus Wallet" $ do
     let addresses = map address $ concatMap (Map.elems . outputs) $ concatMap (Set.toList . transactions) (mconcat epochs)
-    let isOurs = addressIsOurs (Proxy :: Proxy Rnd) (hdPassphrase $ Key daedalusXPrv)
+    let isOurs = addressIsOurs (Proxy :: Proxy Rnd) (hdPassphrase $ keyToXPub daedalusXPrv)
     return $ filter isOurs addresses
 
 restoreYoroiWallet :: [[Block]] -> IO [Address]
@@ -1327,7 +1347,7 @@ runTests = do
 
 chachapolyRountrip :: IO ()
 chachapolyRountrip = do
-    let pw = BS.replicate 32 1 -- NOTE Passowrd must be a 32-length key
+    let pw = BS.replicate 32 1 -- NOTE Password must be a 32-length key
     invariant (return ()) "ChaChaPoly RoundTrip" $
         (encryptDerPath pw "patate" >>= decryptDerPath pw) == return "patate"
 
@@ -1373,36 +1393,30 @@ addressGoldenTest = do
 genYoroiAddr :: Word32 -> Word32 -> ChangeChain -> Address
 genYoroiAddr accIx addrIx changeChain =
     let
-        rootXPrv = Key yoroiXPrv :: Key 'Seq 'Root0
-        acctXPrv = deriveAccountPrivateKey mempty rootXPrv accIx
-        addrXPrv = deriveAddressPrivateKey mempty acctXPrv changeChain addrIx
+        acctXPrv = deriveAccountPrivateKeySeq mempty yoroiXPrv (Index accIx)
+        addrXPrv = deriveAddressPrivateKeySeq mempty acctXPrv changeChain (Index addrIx)
     in
-        toAddress addrXPrv ()
+        seqToAddress (keyToXPub addrXPrv)
 
 genDaedalusAddr :: Word32 -> Word32 -> Address
 genDaedalusAddr accIx addrIx =
     let
-        rootXPrv = Key daedalusXPrv :: Key 'Rnd 'Root0
-        acctXPrv = deriveAccountPrivateKey mempty rootXPrv accIx
-        addrXPrv = deriveAddressPrivateKey mempty acctXPrv undefined addrIx
+        acctXPrv = deriveAccountPrivateKeyRnd mempty daedalusXPrv (Index accIx)
+        addrXPrv = deriveAddressPrivateKeyRnd mempty acctXPrv (Index addrIx)
     in
-        toAddress addrXPrv $ RandomAddressArgs
-            { rndAccountIx = accIx
-            , rndAddressIx = addrIx
-            , rndRootXPrv  = rootXPrv
-            }
+        rndToAddress (keyToXPub addrXPrv) (keyToXPub daedalusXPrv) (Index accIx) (Index addrIx)
 
 -- | A root private key using the sequential scheme on MAINNET.
 -- Kindly by Patrick from QA.
-yoroiXPrv :: XPrv
-yoroiXPrv = generateNew @ByteString @ByteString @ByteString
+yoroiXPrv :: Key 'Seq 'Root0 XPrv
+yoroiXPrv = Key $ generateNew @ByteString @ByteString @ByteString
     "v\190\235Y\179#\181s]M\214\142g\178\245\DC4\226\220\f\167"
     mempty
     mempty
 
 -- | A root private key using the random scheme on MAINNET.
 -- Kindly provided by Alan from QA.
-daedalusXPrv :: XPrv
-daedalusXPrv = generate @ByteString @ByteString
+daedalusXPrv :: Key 'Rnd 'Root0 XPrv
+daedalusXPrv = Key $ generate @ByteString @ByteString
     "X >\178\ETB\DLE\GSg\226\192\198z\131\189\186\220(A+\247\204h\253\235\&5\SUB\CAN\176g\223\212c|f"
     mempty
