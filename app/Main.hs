@@ -92,6 +92,7 @@ import           Data.Maybe                       (catMaybes, fromJust, isJust,
 import           Data.Proxy                       (Proxy (..))
 import           Data.Set                         (Set, (\\))
 import qualified Data.Set                         as Set
+import           Data.Text                        (Text)
 import qualified Data.Text.Encoding               as T
 import           Data.Time.Clock                  (diffUTCTime, getCurrentTime)
 import           Data.Word                        (Word16, Word32, Word64,
@@ -111,11 +112,10 @@ import           Cardano.Crypto.Wallet            (ChainCode (..),
                                                    deriveXPub, generate,
                                                    generateNew, toXPub, unXPub)
 
-
 main :: IO ()
 main = do
     runTests
-    network <- newNetworkLayer
+    network <- newNetworkLayer "mainnet"
     epochs <- syncWithMainnet network
 
     timed "Restored Yoroi Wallet" $ do
@@ -840,48 +840,49 @@ data NetworkLayer = NetworkLayer
     , getNetworkTip :: IO BlockHeader
     }
 
+type NetworkName = Text
 
-mkNetworkLayer :: Manager -> NetworkLayer
-mkNetworkLayer manager = NetworkLayer
-    { getBlock = _getBlock manager
-    , getEpoch = _getEpoch manager
-    , getNetworkTip = _getNetworkTip manager
+mkNetworkLayer :: NetworkName -> Manager -> NetworkLayer
+mkNetworkLayer network manager = NetworkLayer
+    { getBlock = _getBlock network manager
+    , getEpoch = _getEpoch network manager
+    , getNetworkTip = _getNetworkTip network manager
     }
 
 
-newNetworkLayer :: IO NetworkLayer
-newNetworkLayer = do
+newNetworkLayer :: NetworkName -> IO NetworkLayer
+newNetworkLayer network = do
     manager <- HTTP.newManager HTTP.defaultManagerSettings
-    return $ mkNetworkLayer manager
+    return $ mkNetworkLayer network manager
 
 
-_getBlock :: Manager -> BlockHeaderHash -> IO Block
-_getBlock manager (BlockHeaderHash hash) = do
+_getBlock :: NetworkName -> Manager -> BlockHeaderHash -> IO Block
+_getBlock network manager (BlockHeaderHash hash) = do
     let req = defaultRequest
             { port = 1337
-            , path = "/mainnet/block/" <> hash
+            , path = "/" <> T.encodeUtf8 network <> "/block/" <> hash
             }
     res <- httpLbs req manager
     let block = unsafeDeserialiseFromBytes decodeBlock $ responseBody res
     return block
 
 
-_getEpoch :: Manager -> Int -> IO [Block]
-_getEpoch manager n = do
+_getEpoch :: NetworkName -> Manager -> Int -> IO [Block]
+_getEpoch network manager n = do
     let req = defaultRequest
             { port = 1337
-            , path = "/mainnet/epoch/" <> B8.pack (show n)
+            , path = "/" <> T.encodeUtf8 network <> "/epoch/" <> B8.pack (show n)
             }
     res <- httpLbs req manager
     let epoch = deserialiseEpoch decodeBlock (responseBody res)
     return epoch
 
 
-_getNetworkTip :: Manager -> IO BlockHeader
-_getNetworkTip manager = do
+_getNetworkTip :: NetworkName -> Manager -> IO BlockHeader
+_getNetworkTip network manager = do
     let req = defaultRequest
             { port = 1337
-            , path = "/mainnet/tip"
+            , path = "/" <> T.encodeUtf8 network <> "/tip"
             }
     res <- httpLbs req manager
     let tip = unsafeDeserialiseFromBytes decodeBlockHeader $ responseBody res
