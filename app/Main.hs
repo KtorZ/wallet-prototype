@@ -1,12 +1,16 @@
-{-# LANGUAGE BangPatterns        #-}
-{-# LANGUAGE DataKinds           #-}
-{-# LANGUAGE DeriveGeneric       #-}
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE RankNTypes          #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications    #-}
-{-# LANGUAGE TypeFamilies        #-}
+{-# LANGUAGE BangPatterns           #-}
+{-# LANGUAGE DataKinds              #-}
+{-# LANGUAGE DeriveGeneric          #-}
+{-# LANGUAGE FlexibleContexts       #-}
+{-# LANGUAGE GADTs                  #-}
+{-# LANGUAGE LambdaCase             #-}
+{-# LANGUAGE MultiParamTypeClasses  #-}
+{-# LANGUAGE OverloadedStrings      #-}
+{-# LANGUAGE RankNTypes             #-}
+{-# LANGUAGE ScopedTypeVariables    #-}
+{-# LANGUAGE TypeApplications       #-}
+{-# LANGUAGE TypeFamilies           #-}
+{-# LANGUAGE TypeFamilyDependencies #-}
 
 {-| This module contains some prototypal code for a minimal viable wallet
    backend. It currently works with the existing Byron chain, and support the
@@ -39,57 +43,60 @@
 
 module Main where
 
-import qualified Codec.CBOR.Decoding          as CBOR
-import qualified Codec.CBOR.Encoding          as CBOR
-import qualified Codec.CBOR.Read              as CBOR
-import qualified Codec.CBOR.Write             as CBOR
-import           Control.Arrow                (first)
-import           Control.DeepSeq              (NFData, deepseq)
-import           Control.Monad                (forM_, void, when)
-import qualified Crypto.Cipher.ChaChaPoly1305 as Poly
-import           Crypto.Error                 (CryptoError (..),
-                                               CryptoFailable (..))
-import           Crypto.Hash                  (hash)
-import           Crypto.Hash.Algorithms       (Blake2b_224, Blake2b_256,
-                                               SHA3_256, SHA512 (..))
-import qualified Crypto.KDF.PBKDF2            as PBKDF2
-import           Data.Aeson                   (ToJSON (..))
-import qualified Data.Aeson                   as Aeson
-import qualified Data.Aeson.Encode.Pretty     as Aeson
-import           Data.Bits                    (shiftL, (.|.))
-import qualified Data.ByteArray               as BA
-import           Data.ByteString              (ByteString)
-import qualified Data.ByteString              as BS
-import qualified Data.ByteString.Base16       as B16
-import           Data.ByteString.Base58       (bitcoinAlphabet, encodeBase58)
-import qualified Data.ByteString.Char8        as B8
-import qualified Data.ByteString.Lazy         as BL
-import qualified Data.ByteString.Lazy.Char8   as BL8
-import           Data.Digest.CRC32            (crc32)
-import           Data.Int                     (Int64)
-import           Data.List                    (intersect, partition)
-import           Data.List.NonEmpty           (NonEmpty (..))
-import           Data.Map.Strict              (Map)
-import qualified Data.Map.Strict              as Map
-import           Data.Proxy                   (Proxy (..))
-import           Data.Set                     (Set, (\\))
-import qualified Data.Set                     as Set
-import qualified Data.Text.Encoding           as T
-import           Data.Time.Clock              (diffUTCTime, getCurrentTime)
-import           Data.Word                    (Word16, Word32, Word64, Word8)
-import           Debug.Trace                  (trace, traceShow)
-import           GHC.Generics                 (Generic)
-import           GHC.TypeLits                 (Symbol)
-import           Network.HTTP.Client          (Manager, defaultRequest, httpLbs,
-                                               path, port, responseBody,
-                                               responseStatus)
-import qualified Network.HTTP.Client          as HTTP
+import qualified Codec.CBOR.Decoding              as CBOR
+import qualified Codec.CBOR.Encoding              as CBOR
+import qualified Codec.CBOR.Read                  as CBOR
+import qualified Codec.CBOR.Write                 as CBOR
+import           Control.Arrow                    (first)
+import           Control.DeepSeq                  (NFData, deepseq)
+import           Control.Monad                    (forM_, void, when)
+import           Control.Monad.Trans.State.Strict (State, runState, state)
+import qualified Crypto.Cipher.ChaChaPoly1305     as Poly
+import           Crypto.Error                     (CryptoError (..),
+                                                   CryptoFailable (..))
+import           Crypto.Hash                      (hash)
+import           Crypto.Hash.Algorithms           (Blake2b_224, Blake2b_256,
+                                                   SHA3_256, SHA512 (..))
+import qualified Crypto.KDF.PBKDF2                as PBKDF2
+import           Data.Aeson                       (ToJSON (..))
+import qualified Data.Aeson                       as Aeson
+import qualified Data.Aeson.Encode.Pretty         as Aeson
+import           Data.Bits                        (shiftL, (.|.))
+import qualified Data.ByteArray                   as BA
+import           Data.ByteString                  (ByteString)
+import qualified Data.ByteString                  as BS
+import qualified Data.ByteString.Base16           as B16
+import           Data.ByteString.Base58           (bitcoinAlphabet,
+                                                   encodeBase58)
+import qualified Data.ByteString.Char8            as B8
+import qualified Data.ByteString.Lazy             as BL
+import qualified Data.ByteString.Lazy.Char8       as BL8
+import           Data.Digest.CRC32                (crc32)
+import           Data.Int                         (Int64)
+import           Data.List                        (intersect, partition)
+import           Data.List.NonEmpty               (NonEmpty (..))
+import           Data.Map.Strict                  (Map)
+import qualified Data.Map.Strict                  as Map
+import           Data.Proxy                       (Proxy (..))
+import           Data.Set                         (Set, (\\))
+import qualified Data.Set                         as Set
+import qualified Data.Text.Encoding               as T
+import           Data.Time.Clock                  (diffUTCTime, getCurrentTime)
+import           Data.Word                        (Word16, Word32, Word64,
+                                                   Word8)
+import           Debug.Trace                      (trace, traceShow)
+import           GHC.Generics                     (Generic)
+import           GHC.TypeLits                     (Symbol)
+import           Network.HTTP.Client              (Manager, defaultRequest,
+                                                   httpLbs, path, port,
+                                                   responseBody, responseStatus)
+import qualified Network.HTTP.Client              as HTTP
 
-import           Cardano.Crypto.Wallet        (ChainCode (..),
-                                               DerivationScheme (..), XPrv,
-                                               XPub (..), deriveXPrv,
-                                               deriveXPub, generate,
-                                               generateNew, toXPub, unXPub)
+import           Cardano.Crypto.Wallet            (ChainCode (..),
+                                                   DerivationScheme (..), XPrv,
+                                                   XPub (..), deriveXPrv,
+                                                   deriveXPub, generate,
+                                                   generateNew, toXPub, unXPub)
 
 
 main :: IO ()
@@ -255,16 +262,19 @@ txutxo =
         UTxO $ Map.mapKeys (TxIn (txId tx)) outs
 
 txoutsOurs
-    :: AddressIsOurs s
-    => (Proxy s, AddressIsOursArg s)
+    :: forall s. (Address -> s -> (Bool, s))
     -> Set Tx
-    -> Set TxOut
-txoutsOurs (proxy, creds) =
-    Set.unions . Set.map txoutOurs
+    -> s
+    -> (Set TxOut, s)
+txoutsOurs isOurs txs =
+    runState $ Set.fromList . mconcat <$> traverse txoutOurs (Set.toList txs)
  where
-    txoutOurs :: Tx -> Set TxOut
-    txoutOurs (Tx _ outs) =
-        Set.filter (addressIsOurs proxy creds . address) $ Set.fromList $ Map.elems outs
+    txoutOurs :: Tx -> State s [TxOut]
+    txoutOurs (Tx _ outs) = do
+        outs' <- flip Map.traverseMaybeWithKey outs $ \_ out -> do
+            predicate <- state $ isOurs (address out)
+            return $ if predicate then Just out else Nothing
+        return $ Map.elems outs
 
 
 -- * UTxO Manipulation
@@ -294,29 +304,27 @@ balance (UTxO utxo) =
     mconcat $ map coin $ Map.elems utxo
 
 changeUTxO
-    :: AddressIsOurs s
-    => (Proxy s, AddressIsOursArg s)
-    -> Set Tx -> UTxO
-changeUTxO isOurs pending =
-    let
-        ours = txoutsOurs isOurs pending
-        ins  = txins pending
-    in
-        (txutxo pending `restrictedTo` ours) `restrictedBy` ins
+    :: forall s. (Address -> s -> (Bool, s))
+    -> Set Tx
+    -> s
+    -> (UTxO, s)
+changeUTxO isOurs pending = runState $ do
+    ours <- state $ txoutsOurs isOurs pending
+    let ins  = txins pending
+    return $ (txutxo pending `restrictedTo` ours) `restrictedBy` ins
 
 updateUTxO
-    :: AddressIsOurs s
-    => (Proxy s, AddressIsOursArg s)
+    :: forall s. (Address -> s -> (Bool, s))
     -> Block
     -> UTxO
-    -> UTxO
-updateUTxO isOurs b utxo =
-    let
-        txs   = transactions b
-        utxo' = txutxo txs `restrictedTo` txoutsOurs isOurs txs
-        ins   = txins txs
-    in
-        (utxo <> utxo') `excluding` ins
+    -> s
+    -> (UTxO, s)
+updateUTxO isOurs b utxo = runState $ do
+    let txs = transactions b
+    ours <- state $ txoutsOurs isOurs txs
+    let utxo' = txutxo txs `restrictedTo` ours
+    let ins = txins txs
+    return $ (utxo <> utxo') `excluding` ins
 
 updatePending :: Block -> Set Tx -> Set Tx
 updatePending b =
@@ -328,70 +336,77 @@ updatePending b =
 
 -- * Wallet
 
-data Wallet = Wallet
-    { walletUTxO    :: UTxO
-    , walletPending :: Set Tx
-    }
+data Wallet scheme where
+    Wallet
+        :: (IsOurs scheme, Semigroup (SchemeState scheme))
+        => UTxO
+        -> Set Tx
+        -> SchemeState scheme
+        -> Wallet scheme
 
-type Checkpoints = NonEmpty Wallet
+type Checkpoints scheme = NonEmpty (Wallet scheme)
 
-instance Semigroup Wallet where
-    (Wallet u1 p1) <> (Wallet u2 p2) =
-        Wallet (u1 <> u2) (p1 <> p2)
+instance Semigroup (Wallet scheme) where
+    (Wallet u1 p1 s1) <> (Wallet u2 p2 s2) =
+        Wallet (u1 <> u2) (p1 <> p2) (s1 <> s2)
 
-instance Monoid Wallet where
-  mempty  = Wallet mempty mempty
-  mconcat = foldr (<>) mempty
-
-availableBalance :: Wallet -> Coin
+availableBalance :: Wallet scheme -> Coin
 availableBalance =
     balance . availableUTxO
 
-availableUTxO :: Wallet -> UTxO
-availableUTxO (Wallet utxo pending) =
+availableUTxO :: Wallet scheme -> UTxO
+availableUTxO (Wallet utxo pending _) =
     utxo `excluding` txins pending
 
 totalUTxO
-    :: AddressIsOurs s
-    => (Proxy s, AddressIsOursArg s)
-    -> Wallet
+    :: forall scheme. ()
+    => Wallet scheme
     -> UTxO
-totalUTxO isOurs wallet@(Wallet _ pending) =
-    availableUTxO wallet <> changeUTxO isOurs pending
+totalUTxO wallet@(Wallet _ pending s) =
+    let
+        isOurs = addressIsOurs (Proxy :: Proxy scheme)
+        -- NOTE
+        -- We _safely_ discard the state here because we aren't intending to
+        -- discover any new addresses through this operation. In practice, we can
+        -- only discover new addresses when applying blocks.
+        discardState = fst
+    in
+        availableUTxO wallet <> discardState (changeUTxO isOurs pending s)
 
 totalBalance
-    :: AddressIsOurs s
-    => (Proxy s, AddressIsOursArg s)
-    -> Wallet
+    :: Wallet scheme
     -> Coin
-totalBalance isOurs =
-    balance . totalUTxO isOurs
+totalBalance =
+    balance . totalUTxO
 
 applyBlock
-    :: AddressIsOurs s
-    => (Proxy s, AddressIsOursArg s)
-    -> Block
-    -> Checkpoints
-    -> Checkpoints
-applyBlock isOurs b (Wallet utxo pending :| checkpoints) =
+    :: forall scheme. ()
+    => Block
+    -> Checkpoints scheme
+    -> Checkpoints scheme
+applyBlock b (Wallet utxo pending s :| checkpoints) =
     invariant applyBlockSafe "applyBlock requires: dom (utxo b) ∩ dom utxo = ∅" $
         Set.null $ dom (txutxo $ transactions b) `Set.intersection` dom utxo
   where
     applyBlockSafe =
-        Wallet (updateUTxO isOurs b utxo) (updatePending b pending) :| checkpoints
+        let
+            (utxo', s') = updateUTxO (addressIsOurs (Proxy :: Proxy scheme)) b utxo s
+            pending' = updatePending b pending
+        in
+            Wallet utxo' pending' s' :| checkpoints
 
-newPending :: Tx -> Checkpoints -> Checkpoints
-newPending tx (wallet@(Wallet utxo pending) :| checkpoints) =
+newPending :: Tx -> Checkpoints scheme -> Checkpoints scheme
+newPending tx (wallet@(Wallet utxo pending s) :| checkpoints) =
     invariant newPendingSafe "newPending requires: ins ⊆ dom (available (utxo, pending))" $
         Set.null $ inputs tx \\ dom (availableUTxO wallet)
   where
     newPendingSafe =
-        Wallet utxo (pending <> Set.singleton tx) :| checkpoints
+        Wallet utxo (pending <> Set.singleton tx) s :| checkpoints
 
-rollback :: Checkpoints -> Checkpoints
+rollback :: Checkpoints scheme -> Checkpoints scheme
 rollback = \case
-    Wallet _ pending :| Wallet utxo' pending' : checkpoints ->
-        Wallet utxo' (pending <> pending') :| checkpoints
+    Wallet _ pending _ :| Wallet utxo' pending' s' : checkpoints ->
+        Wallet utxo' (pending <> pending') s' :| checkpoints
     checkpoints ->
         checkpoints
 
@@ -571,34 +586,44 @@ seqToAddress (Key xpub) =
                              ADDRESS DISCOVERY
 --------------------------------------------------------------------------------}
 
-class AddressIsOurs (scheme :: Scheme) where
-    type AddressIsOursArg scheme :: *
-    addressIsOurs :: Proxy scheme -> AddressIsOursArg scheme -> Address -> Bool
+class IsOurs (scheme :: Scheme) where
+    type SchemeState scheme :: *
+    addressIsOurs
+        :: Proxy scheme
+        -> Address
+        -> SchemeState scheme
+        -> (Bool, SchemeState scheme)
 
 
 -- * Random Derivation
 
-instance AddressIsOurs 'Rnd where
-    type AddressIsOursArg 'Rnd = ByteString
-    addressIsOurs _ passphrase (Address bytes) =
+instance IsOurs 'Rnd where
+    type SchemeState 'Rnd = ByteString
+    addressIsOurs _ (Address bytes) passphrase =
         let
             payload = unsafeDeserialiseFromBytes decodeAddressPayload (BL.fromStrict bytes)
         in
         case unsafeDeserialiseFromBytes (decodeAddressDerivationPath passphrase) (BL.fromStrict payload) of
-            Just (_, _) -> True
-            _           -> False
+            Just (_, _) -> (True, passphrase)
+            _           -> (False, passphrase)
 
 
 -- * Sequential Derivation
 
+data AddressPool = AddressPool
+    { poolAddresses :: [Address]
+    }
+
+
 -- Address Pool Discovery in a VERY simplistic form. We've just generated
 -- "all" the addresses upfront and look them up in the list.
--- In order to properly implement that, we'll to make 'AddressIsOurs' stateful
--- (i.e. return the 'AddressIsOursArg scheme' with the Bool) which requires a
+-- In order to properly implement that, we'll to make 'IsOurs' stateful
+-- (i.e. return the 'IsOursArg scheme' with the Bool) which requires a
 -- bit of fiddling with the wallet core logic.
-instance AddressIsOurs 'Seq where
-    type AddressIsOursArg 'Seq = [Address]
-    addressIsOurs _ pool addr = addr `elem` pool
+instance IsOurs 'Seq where
+    type SchemeState 'Seq = AddressPool
+    addressIsOurs _ addr (AddressPool pool) =
+        (addr `elem` pool, AddressPool pool)
 
 
 {-------------------------------------------------------------------------------
@@ -1325,7 +1350,7 @@ syncWithMainnet network = timed "Sync With Mainnet" $ do
 restoreDaedalusWallet :: [[Block]] -> IO [Address]
 restoreDaedalusWallet epochs = timed "Restore Daedalus Wallet" $ do
     let addresses = map address $ concatMap (Map.elems . outputs) $ concatMap (Set.toList . transactions) (mconcat epochs)
-    let isOurs = addressIsOurs (Proxy :: Proxy Rnd) (hdPassphrase $ keyToXPub daedalusXPrv)
+    let isOurs = fst . flip (addressIsOurs (Proxy @Rnd)) (hdPassphrase $ keyToXPub daedalusXPrv)
     return $ filter isOurs addresses
 
 restoreYoroiWallet :: [[Block]] -> IO [Address]
@@ -1337,7 +1362,7 @@ restoreYoroiWallet epochs = timed "Restore Yoroi Wallet" $ do
     let pool =
             map (\n -> genYoroiAddr 0x80000000 n InternalChain) [0..100] <>
             map (\n -> genYoroiAddr 0x80000000 n ExternalChain) [0..100]
-    let isOurs = addressIsOurs (Proxy :: Proxy Seq) pool
+    let isOurs = fst . flip (addressIsOurs (Proxy @Seq)) (AddressPool pool)
     return $ filter isOurs addresses
 
 runTests :: IO ()
