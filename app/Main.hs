@@ -1,16 +1,18 @@
-{-# LANGUAGE BangPatterns           #-}
-{-# LANGUAGE DataKinds              #-}
-{-# LANGUAGE DeriveGeneric          #-}
-{-# LANGUAGE FlexibleContexts       #-}
-{-# LANGUAGE GADTs                  #-}
-{-# LANGUAGE LambdaCase             #-}
-{-# LANGUAGE MultiParamTypeClasses  #-}
-{-# LANGUAGE OverloadedStrings      #-}
-{-# LANGUAGE RankNTypes             #-}
-{-# LANGUAGE ScopedTypeVariables    #-}
-{-# LANGUAGE TypeApplications       #-}
-{-# LANGUAGE TypeFamilies           #-}
-{-# LANGUAGE TypeFamilyDependencies #-}
+{-# LANGUAGE BangPatterns               #-}
+{-# LANGUAGE DataKinds                  #-}
+{-# LANGUAGE DeriveGeneric              #-}
+{-# LANGUAGE DerivingStrategies         #-}
+{-# LANGUAGE FlexibleContexts           #-}
+{-# LANGUAGE GADTs                      #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE MultiParamTypeClasses      #-}
+{-# LANGUAGE OverloadedLabels           #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE TypeApplications           #-}
+{-# LANGUAGE TypeFamilies               #-}
 
 {-| This module contains some prototypal code for a minimal viable wallet
    backend. It currently works with the existing Byron chain, and support the
@@ -72,11 +74,13 @@ import qualified Data.ByteString.Char8            as B8
 import qualified Data.ByteString.Lazy             as BL
 import qualified Data.ByteString.Lazy.Char8       as BL8
 import           Data.Digest.CRC32                (crc32)
+import           Data.Generics.Labels             ()
 import           Data.Int                         (Int64)
 import           Data.List                        (intersect, partition)
 import           Data.List.NonEmpty               (NonEmpty (..))
 import           Data.Map.Strict                  (Map)
 import qualified Data.Map.Strict                  as Map
+import           Data.Maybe                       (catMaybes, fromJust, isJust)
 import           Data.Proxy                       (Proxy (..))
 import           Data.Set                         (Set, (\\))
 import qualified Data.Set                         as Set
@@ -87,6 +91,7 @@ import           Data.Word                        (Word16, Word32, Word64,
 import           Debug.Trace                      (trace, traceShow)
 import           GHC.Generics                     (Generic)
 import           GHC.TypeLits                     (Symbol)
+import           Lens.Micro                       (at, (%~), (&), (.~), (^.))
 import           Network.HTTP.Client              (Manager, defaultRequest,
                                                    httpLbs, path, port,
                                                    responseBody, responseStatus)
@@ -104,7 +109,7 @@ main = do
     runTests
     network <- newNetworkLayer
     epochs <- syncWithMainnet network
-    restoreDaedalusWallet epochs >>= prettyPrint
+--    restoreDaedalusWallet epochs >>= prettyPrint
     restoreYoroiWallet epochs >>= prettyPrint
 
 
@@ -425,7 +430,8 @@ keyToXPub (Key xprv) = Key (toXPub xprv)
 
 -- Also introducing a type helper to distinguish between indexes
 newtype Index (derivationType :: DerivationType) (level :: Depth) = Index
-    { getIndex :: Word32 }
+    { getIndex :: Word32
+    }
 
 data Scheme
     = Seq
@@ -611,19 +617,72 @@ instance IsOurs 'Rnd where
 -- * Sequential Derivation
 
 data AddressPool = AddressPool
-    { poolAddresses :: [Address]
-    }
+    { accountPubKey
+        :: Key 'Seq 'Acct3 XPub
+    , gap
+        :: Word8
+    , changeChain
+        :: ChangeChain
+    , addresses
+        :: Map Address (Index 'Soft 'Addr5)
+    } deriving (Generic)
 
+lookupAddressPool
+    :: Address
+    -> AddressPool
+    -> (Maybe (Address, Index 'Soft 'Addr5), AddressPool)
+lookupAddressPool target pool =
+    case Map.lookup target (pool ^. #addresses) of
+        Just ix ->
+            (Just (target, ix), extendAddressPool ix pool)
+        Nothing ->
+            (Nothing, pool)
 
--- Address Pool Discovery in a VERY simplistic form. We've just generated
--- "all" the addresses upfront and look them up in the list.
--- In order to properly implement that, we'll to make 'IsOurs' stateful
--- (i.e. return the 'IsOursArg scheme' with the Bool) which requires a
--- bit of fiddling with the wallet core logic.
+extendAddressPool
+    :: Index 'Soft 'Addr5
+    -> AddressPool
+    -> AddressPool
+extendAddressPool (Index ix) pool
+    | isOnEdge  = pool & #addresses %~ (next <>)
+    | otherwise = pool
+  where
+    edge = Map.size (pool ^. #addresses)
+    isOnEdge = fromIntegral edge - ix <= fromIntegral (pool ^. #gap)
+    next = nextAddresses
+        (pool ^. #accountPubKey)
+        (pool ^. #gap)
+        (pool ^. #changeChain)
+        (Index $ ix + 1)
+
+nextAddresses
+    :: Key 'Seq 'Acct3 XPub
+    -> Word8
+    -> ChangeChain
+    -> Index 'Soft 'Addr5
+    -> Map Address (Index 'Soft 'Addr5)
+nextAddresses key g changeChain (Index fromIx) =
+    invariant safeNextAddresses "nextAddresses: toIx should be greater than fromIx" (toIx >= fromIx)
+  where
+    safeNextAddresses = [fromIx .. toIx]
+        & map (\ix -> (newAddress (Index ix), Index ix))
+        & Map.fromList
+    toIx = fromIx + fromIntegral g - 1
+    newAddress ix =
+        let
+            addr = deriveAddressPublicKeySeq key changeChain ix
+        in
+            invariant
+                (seqToAddress $ fromJust addr)
+                "nextAddresses: can't generate more addresses, max index reached"
+                (isJust addr)
+
 instance IsOurs 'Seq where
     type SchemeState 'Seq = AddressPool
-    addressIsOurs _ addr (AddressPool pool) =
-        (addr `elem` pool, AddressPool pool)
+    addressIsOurs _ addr = runState $ do
+        maddr <- state $ lookupAddressPool addr
+        return $ case maddr of
+            Just (_, Index ix) -> traceShow ix True
+            Nothing            -> False
 
 
 {-------------------------------------------------------------------------------
@@ -1345,25 +1404,44 @@ prettyPrint =
 syncWithMainnet :: NetworkLayer -> IO [[Block]]
 syncWithMainnet network = timed "Sync With Mainnet" $ do
     tip <- getNetworkTip network
-    traverse (getEpoch network) [0..(fromIntegral (epochIndex tip) - 1)]
+    traverse (getEpoch network) [95..(fromIntegral (epochIndex tip) - 1)]
 
 restoreDaedalusWallet :: [[Block]] -> IO [Address]
 restoreDaedalusWallet epochs = timed "Restore Daedalus Wallet" $ do
-    let addresses = map address $ concatMap (Map.elems . outputs) $ concatMap (Set.toList . transactions) (mconcat epochs)
+    let addresses = epochs
+            & mconcat
+            & concatMap (Set.toList . transactions)
+            & concatMap (Map.elems . outputs)
+            & map address
     let isOurs = fst . flip (addressIsOurs (Proxy @Rnd)) (hdPassphrase $ keyToXPub daedalusXPrv)
     return $ filter isOurs addresses
 
 restoreYoroiWallet :: [[Block]] -> IO [Address]
 restoreYoroiWallet epochs = timed "Restore Yoroi Wallet" $ do
-    let addresses = map address $ concatMap (Map.elems . outputs) $ concatMap (Set.toList . transactions) (mconcat epochs)
-    -- Quick'n'dirty Pool Generation, will refine later. We just generate a
-    -- bunch of addresses from the first accounts. In practice, we do want to
-    -- respect the gap and generate addresses as we discover them.
-    let pool =
-            map (\n -> genYoroiAddr 0x80000000 n InternalChain) [0..100] <>
-            map (\n -> genYoroiAddr 0x80000000 n ExternalChain) [0..100]
-    let isOurs = fst . flip (addressIsOurs (Proxy @Seq)) (AddressPool pool)
-    return $ filter isOurs addresses
+    let addresses = epochs
+            & mconcat
+            & concatMap (Set.toList . transactions)
+            & concatMap (Map.elems . outputs)
+            & map address
+
+    let accKey = keyToXPub $ deriveAccountPrivateKeySeq mempty yoroiXPrv (Index 0x80000000)
+    -- NOTE
+    -- We have to scan both the internal and external chain. Note that, the
+    -- account discovery algorithm is only specified for the external chain so
+    -- in theory, there's nothing forcing a wallet to generate change
+    -- addresses on the internal chain anywhere in the available range.
+    --
+    -- In practice, we may assume that user can't create change addresses and
+    -- that they are just created in sequence by the wallet. Hence an address
+    -- pool with a gap of 1 should be sufficient.
+    let pool  = AddressPool accKey 20 ExternalChain (nextAddresses accKey 20 ExternalChain (Index 0))
+    let pool' = AddressPool accKey 1 InternalChain (nextAddresses accKey 1 InternalChain (Index 0))
+    let f addr = do
+            ours <- state $ addressIsOurs (Proxy @Seq) addr
+            return $ if ours then Just addr else Nothing
+    let (addrs, _) = flip runState pool $ catMaybes <$> traverse f addresses
+    let (addrs', _) = flip runState pool' $ catMaybes <$> traverse f addresses
+    return $ addrs <> addrs'
 
 runTests :: IO ()
 runTests = do
