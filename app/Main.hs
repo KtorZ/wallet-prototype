@@ -70,6 +70,7 @@ import qualified Data.Aeson                       as Aeson
 import qualified Data.Aeson.Encode.Pretty         as Aeson
 import           Data.Bits                        (shiftL, (.|.))
 import qualified Data.ByteArray                   as BA
+import           Data.ByteArray.Encoding          (convertToBase, Base (Base64))
 import           Data.ByteString                  (ByteString)
 import qualified Data.ByteString                  as BS
 import qualified Data.ByteString.Base16           as B16
@@ -103,6 +104,7 @@ import           GHC.TypeLits                     (Symbol)
 import           Lens.Micro                       (at, (%~), (&), (.~), (^.))
 import           Network.HTTP.Client              (Manager, defaultRequest,
                                                    httpLbs, path, port,
+                                                   method, requestBody,
                                                    responseBody, responseStatus)
 import qualified Network.HTTP.Client              as HTTP
 
@@ -307,6 +309,28 @@ txoutsOurs isOurs txs =
             predicate <- state $ isOurs (address out)
             return $ if predicate then Just out else Nothing
         return $ Map.elems outs'
+
+-- |Proof/Witness that a transaction is authorized by the given key holder.
+data Wit = Wit XPub !(Sig Tx) deriving (Show, Eq, Ord)
+
+-- |A digital signature
+data Sig a = Sig BS.ByteString deriving (Show, Eq, Ord)
+
+-- | A fully formed transaction.
+data TxWits = TxWits
+    { body       :: !Tx
+    , witnessSet :: !(Set Wit)
+    } deriving (Show, Eq, Ord, Generic)
+
+{-
+-- |Create a witness for transaction
+makeWitness :: Tx -> KeyPair -> Wit
+makeWitness tx keys = Wit (vKey keys) (sign (sKey keys) tx)
+
+-- |Create witnesses for transaction
+makeWitnesses :: Tx -> [KeyPair] -> Set Wit
+makeWitnesses tx = Set.fromList . fmap (makeWitness tx)
+-}
 
 
 -- * UTxO Manipulation
@@ -834,6 +858,7 @@ data NetworkLayer = NetworkLayer
     { getBlock      :: BlockHeaderHash -> IO Block
     , getEpoch      :: Int -> IO [Block]
     , getNetworkTip :: IO BlockHeader
+    , postSignedTx  :: TxWits -> IO ()
     }
 
 type NetworkName = Text
@@ -843,6 +868,7 @@ mkNetworkLayer network manager = NetworkLayer
     { getBlock = _getBlock network manager
     , getEpoch = _getEpoch network manager
     , getNetworkTip = _getNetworkTip network manager
+    , postSignedTx = _postSignedTx network manager
     }
 
 
@@ -883,6 +909,17 @@ _getNetworkTip network manager = do
     res <- httpLbs req manager
     let tip = unsafeDeserialiseFromBytes decodeBlockHeader $ responseBody res
     return tip
+
+_postSignedTx :: NetworkName -> Manager -> TxWits -> IO ()
+_postSignedTx network manager tx = do
+    let req = defaultRequest
+            { port = 1337
+            , method = "POST"
+            , path = "/" <> T.encodeUtf8 network <> "/txs/signed"
+            , requestBody = HTTP.RequestBodyBS $ convertToBase Base64
+                $ CBOR.toStrictByteString (encodeTxWits tx)
+            }
+    void $ httpLbs req manager
 
 
 {-------------------------------------------------------------------------------
@@ -1374,7 +1411,7 @@ decodeUpdateProof = do
 --------------------------------------------------------------------------------}
 
 encodeAddress :: XPub -> CBOR.Encoding -> CBOR.Encoding
-encodeAddress (XPub pub (ChainCode cc)) encodeAttributes =
+encodeAddress xpub encodeAttributes =
     encodeAddressPayload payload
   where
     payload = CBOR.toStrictByteString $ mempty
@@ -1389,12 +1426,13 @@ encodeAddress (XPub pub (ChainCode cc)) encodeAttributes =
         <> encodeSpendingData
         <> encodeAttributes
 
-    encodeXPub =
-        CBOR.encodeBytes (pub <> cc)
-
     encodeSpendingData = CBOR.encodeListLen 2
         <> CBOR.encodeWord8 0
-        <> encodeXPub
+        <> encodeXPub xpub
+
+encodeXPub :: XPub -> CBOR.Encoding
+encodeXPub (XPub pub (ChainCode cc)) = CBOR.encodeBytes (pub <> cc)
+
 
 encodeAddressPayload :: ByteString -> CBOR.Encoding
 encodeAddressPayload payload = mempty
@@ -1453,6 +1491,22 @@ encodeTxOut (TxOut (Address addr) (Coin coin)) = mempty
   where
     payload = unsafeDeserialiseFromBytes decodeAddressPayload (BL.fromStrict addr)
 
+encodeTxWits :: TxWits -> CBOR.Encoding
+encodeTxWits tx = mempty
+    <> encodeTx (body tx)
+    <> encodeWitnessSet (witnessSet tx)
+
+encodeWitnessSet :: Set Wit -> CBOR.Encoding
+encodeWitnessSet wits = foldMap encodeWit wits
+
+encodeWit :: Wit -> CBOR.Encoding
+encodeWit (Wit key (Sig sig)) = mempty
+    <> CBOR.encodeListLen 2
+    <> CBOR.encodeWord8 0 -- PkWitness
+    <> CBOR.encodeTag 24 -- encodeKnownCborDataItem
+    <> CBOR.encodeListLen 2 -- tuple instance in Pos.Binary.Class.Core
+    <> encodeXPub key
+    <> CBOR.encodeBytes sig
 
 {-------------------------------------------------------------------------------
                                 CBOR EXTRA
@@ -1542,7 +1596,8 @@ syncWithMainnet :: NetworkLayer -> IO [[Block]]
 syncWithMainnet network = timed "Synced With Mainnet" $ do
     tip <- getNetworkTip network
     putStrLn $ "Syncing With Mainnet. Tip: " <> show (epochIndex tip) <> "." <> show (slotNumber tip)
-    traverse (getEpoch network) [95..(fromIntegral (epochIndex tip) - 1)]
+    -- traverse (getEpoch network) [95..(fromIntegral (epochIndex tip) - 1)]
+    traverse (getEpoch network) [0..(fromIntegral (epochIndex tip) - 1)]
 
 runTests :: IO ()
 runTests = do
