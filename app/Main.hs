@@ -132,6 +132,7 @@ main = do
         forM_ epochs (applyBlocks wallet)
         totalBalance wallet >>= prettyPrint . (Aeson.String "Total Balance",)
         totalUTxO wallet >>= prettyPrint . (Aeson.String "Total UTxO",)
+        knownAddresses wallet >>= prettyPrint . (Aeson.String "Addresses",)
 
 
 {-------------------------------------------------------------------------------
@@ -504,7 +505,7 @@ newWalletLayerSeq rootXPrv = do
 
 newWalletLayerRnd :: Key 'Rnd 'Root0 XPrv -> IO (WalletLayer IO)
 newWalletLayerRnd rootXPrv = do
-    mvar <- newMVar $ Wallet @'Rnd mempty mempty (hdPassphrase $ keyToXPub rootXPrv) :| []
+    mvar <- newMVar $ Wallet @'Rnd mempty mempty ((hdPassphrase $ keyToXPub rootXPrv), mempty) :| []
 
     return $ WalletLayer
         { totalBalance = do
@@ -520,12 +521,9 @@ newWalletLayerRnd rootXPrv = do
             let checkpoints' = foldl' (flip _applyBlock) checkpoints blocks
             putMVar mvar checkpoints'
 
-        , knownAddresses =
-            -- NOTE
-            -- This is trickier than for the sequential wallet because, we do
-            -- not store the addresses as we discover them. We could however
-            -- without much change.
-            error "newWalletLayerRnd.knownAddresses: Not Implemented"
+        , knownAddresses = do
+            (Wallet _ _ (_, addrs) :| _) <- readMVar mvar
+            return ((Used,) <$> Set.toList addrs)
         }
 
 
@@ -721,14 +719,14 @@ class IsOurs (scheme :: Scheme) where
 -- * Random Derivation
 
 instance IsOurs 'Rnd where
-    type SchemeState 'Rnd = ByteString
-    addressIsOurs _ (Address bytes) passphrase =
+    type SchemeState 'Rnd = (ByteString, Set Address)
+    addressIsOurs _ a@(Address bytes) (passphrase, addrs) =
         let
             payload = unsafeDeserialiseFromBytes decodeAddressPayload (BL.fromStrict bytes)
         in
         case unsafeDeserialiseFromBytes (decodeAddressDerivationPath passphrase) (BL.fromStrict payload) of
-            Just (_, _) -> (True, passphrase)
-            _           -> (False, passphrase)
+            Just (_, _) -> (True, (passphrase, Set.insert a addrs))
+            _           -> (False, (passphrase, addrs))
 
 
 -- * Sequential Derivation
