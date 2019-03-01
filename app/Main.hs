@@ -322,10 +322,16 @@ data TxWits = TxWits
     , witnessSet :: !(Set Wit)
     } deriving (Show, Eq, Ord, Generic)
 
+-- |Key Pair
+data KeyPair = KeyPair
+    { sKey :: XPrv
+    , vKey :: XPub
+    } deriving (Generic)
+
 {-
 -- |Create a witness for transaction
 makeWitness :: Tx -> KeyPair -> Wit
-makeWitness tx keys = Wit (vKey keys) (sign (sKey keys) tx)
+makeWitness tx keys = Wit (vKey keys) (sign _passphrase (sKey keys) tx)
 
 -- |Create witnesses for transaction
 makeWitnesses :: Tx -> [KeyPair] -> Set Wit
@@ -858,7 +864,7 @@ data NetworkLayer = NetworkLayer
     { getBlock      :: BlockHeaderHash -> IO Block
     , getEpoch      :: Int -> IO [Block]
     , getNetworkTip :: IO BlockHeader
-    , postSignedTx  :: TxWits -> IO ()
+    , postSignedTx  :: BS.ByteString -> IO ()
     }
 
 type NetworkName = Text
@@ -910,14 +916,13 @@ _getNetworkTip network manager = do
     let tip = unsafeDeserialiseFromBytes decodeBlockHeader $ responseBody res
     return tip
 
-_postSignedTx :: NetworkName -> Manager -> TxWits -> IO ()
+_postSignedTx :: NetworkName -> Manager -> BS.ByteString -> IO ()
 _postSignedTx network manager tx = do
     let req = defaultRequest
             { port = 1337
             , method = "POST"
             , path = "/" <> T.encodeUtf8 network <> "/txs/signed"
-            , requestBody = HTTP.RequestBodyBS $ convertToBase Base64
-                $ CBOR.toStrictByteString (encodeTxWits tx)
+            , requestBody = HTTP.RequestBodyBS $ convertToBase Base64 tx
             }
     void $ httpLbs req manager
 
@@ -1598,6 +1603,12 @@ syncWithMainnet network = timed "Synced With Mainnet" $ do
     putStrLn $ "Syncing With Mainnet. Tip: " <> show (epochIndex tip) <> "." <> show (slotNumber tip)
     -- traverse (getEpoch network) [95..(fromIntegral (epochIndex tip) - 1)]
     traverse (getEpoch network) [0..(fromIntegral (epochIndex tip) - 1)]
+
+postSignedTx' :: NetworkLayer -> TxWits -> IO TxId
+postSignedTx' network tx = do
+    let tx' = CBOR.toStrictByteString (encodeTxWits tx)
+    postSignedTx network tx'
+    pure $ txId $ body tx
 
 runTests :: IO ()
 runTests = do
